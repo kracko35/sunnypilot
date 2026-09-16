@@ -7,41 +7,64 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 import argparse
+import atexit
 import math
+import multiprocessing as mp
 import os
+import shutil
+import sys
 import tempfile
 import time
 from functools import partial
-from openpilot.selfdrive.modeld.helpers import dump_oob, load_oob
+
 import numpy as np
+
+from openpilot.common.file_chunker import chunk_file, get_chunk_targets, open_file_chunked
+from openpilot.sunnypilot.modeld_v2.helpers import dump_oob, load_oob
+import openpilot.sunnypilot.modeld_v2.stock_dependencies as stock
+from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+
+from tinygrad import dtypes
+from tinygrad.device import Device
+from tinygrad.engine.jit import TinyJit, _TinyJit
+from tinygrad.nn.onnx import OnnxRunner
+from tinygrad.tensor import Tensor
+
 os.environ['GMMU'] = '0'
 
 def _patch_tinygrad_fetch_fw():
-  import hashlib
-  import pathlib
-  import zstandard
-  from tinygrad import helpers
-  _orig_fetch_fw = helpers.fetch_fw
-  def fetch_fw(path, name, sha256):
-    p = pathlib.Path(f"/lib/firmware/{path}/{name}.zst")
-    if p.is_file():
-      blob = zstandard.ZstdDecompressor().stream_reader(p.read_bytes()).read()
-      if hashlib.sha256(blob).hexdigest() == sha256:
-        return blob
-    return _orig_fetch_fw(path, name, sha256)
-  helpers.fetch_fw = fetch_fw
+  try:
+    import hashlib
+    import pathlib
+    import zstandard
+    from tinygrad import helpers
+    _orig_fetch_fw = helpers.fetch_fw
+    def fetch_fw(path, name, sha256):
+      p = pathlib.Path(f"/lib/firmware/{path}/{name}.zst")
+      if p.is_file():
+        blob = zstandard.ZstdDecompressor().stream_reader(p.read_bytes()).read()
+        if hashlib.sha256(blob).hexdigest() == sha256:
+          return blob
+      return _orig_fetch_fw(path, name, sha256)
+    helpers.fetch_fw = fetch_fw
+  except ImportError:
+    pass
 _patch_tinygrad_fetch_fw()
 
-import openpilot.selfdrive.modeld.compile_modeld as stock
-from tinygrad import dtypes
-from tinygrad.device import Device
-from tinygrad.engine.jit import TinyJit
-from tinygrad.tensor import Tensor
+def _patch_ops_serialization():
+  try:
+    from tinygrad.uop.ops import Ops
+    def __reduce_ex__(self, proto):
+      return (getattr, (self.__class__, self.name))
+    Ops.__reduce_ex__ = __reduce_ex__
+  except ImportError:
+    pass
+_patch_ops_serialization()
 
 MODEL_TYPES = ('vision_policy', 'supercombo', 'vision_multi_policy')
 WARP_INPUTS = ['tfm', 'big_tfm']
 POLICY_INPUTS = ['img_q', 'big_img_q', 'feat_q', 'desire_q', 'packed_npy_inputs']
-nv12_copy_size = stock.nv12_copy_size
+
 
 def _detect_desire_key(shapes: dict) -> str | None:
   return next((key for key in shapes if key.startswith('desire')), None)
@@ -123,7 +146,10 @@ def generate_queues_and_npy(input_shapes: dict, frame_skip: int, device: str = D
     queues['feat_q'] = Tensor(np.zeros((feat_q_len, features_buffer[0], feat_dim),
                        dtype=np.float32), device=device).contiguous().realize()
 
-  queues.update({key: Tensor(value, device='NPY').realize() for key, value in npy_arrays.items() if key in ('tfm', 'big_tfm')})
+  for key in ('tfm', 'big_tfm'):
+    if key in npy_arrays:
+      npy_arrays[key] = np.eye(3, dtype=np.float32)
+      queues[key] = Tensor(npy_arrays[key], device='NPY').realize()
 
   return queues, npy_arrays
 
@@ -164,8 +190,7 @@ def make_run_policy(vision_runner, policy_runners: list, features_slice: slice, 
   is_supercombo = vision_runner is None
   npy_shapes, npy_sizes = get_policy_npy_shapes(input_shapes, is_supercombo=is_supercombo)
 
-  def run_policy(warped, img_q, big_img_q, feat_q, packed_npy_inputs, **kwargs):
-    desire_q = kwargs['desire_q']
+  def run_policy(warped, img_q, big_img_q, feat_q, desire_q=None, packed_npy_inputs=None, **kwargs):
     packed_npy_inputs_dev = packed_npy_inputs.to(Device.DEFAULT)
     warped_dev = warped.to(Device.DEFAULT)
     Tensor.realize(packed_npy_inputs_dev, warped_dev)
@@ -209,7 +234,11 @@ def make_run_policy(vision_runner, policy_runners: list, features_slice: slice, 
   return run_policy
 
 
-def compile_jit(jit, input_keys, make_queues, make_random_inputs=None, benchmark_runs: int = 1):
+def compile_jit(jit_or_func, input_keys, make_queues, make_random_inputs=None, benchmark_runs: int = 1):
+  if not isinstance(jit_or_func, _TinyJit):
+    jit = TinyJit(jit_or_func, prune=True)
+  else:
+    jit = jit_or_func
   SEED = 42
   def random_inputs_run(fn, seed, n_runs, test_val=None, test_buffers=None, expect_match=True):
     queues_res = make_queues(Device.DEFAULT)
@@ -224,7 +253,7 @@ def compile_jit(jit, input_keys, make_queues, make_random_inputs=None, benchmark
       for v in frame_views.values():
         v[:] = rng.integers(0, 256, size=v.shape, dtype=np.uint8)
       Device.default.synchronize()
-      random_inputs = make_random_inputs(rng=rng) if make_random_inputs is not None else {}
+      random_inputs = make_random_inputs() if make_random_inputs is not None else {}
       st = time.perf_counter()
       outs = fn(**{k: input_queues[k] for k in input_keys if k in input_queues}, **random_inputs)
       mt = time.perf_counter()
@@ -237,11 +266,19 @@ def compile_jit(jit, input_keys, make_queues, make_random_inputs=None, benchmark
         buffers = [np.copy(v.numpy().copy()) for v in input_queues.values()]
 
     if test_val is not None:
-      match = all(np.array_equal(a, b) for a, b in zip(val, test_val, strict=True))
-      assert match == expect_match, f"outputs {'differ from' if expect_match else 'match'} baseline (seed={seed})"
+      if expect_match:
+        for a, b in zip(val, test_val, strict=True):
+          np.testing.assert_array_equal(a, b, err_msg=f"outputs differ from baseline (seed={seed})")
+      else:
+        match = all(np.array_equal(a, b) for a, b in zip(val, test_val, strict=True))
+        assert not match, f"outputs match baseline unexpectedly (seed={seed})"
     if test_buffers is not None:
-      match = all(np.array_equal(a, b) for a, b in zip(buffers, test_buffers, strict=True))
-      assert match == expect_match, f"buffers {'differ from' if expect_match else 'match'} baseline (seed={seed})"
+      if expect_match:
+        for a, b in zip(buffers, test_buffers, strict=True):
+          np.testing.assert_array_equal(a, b, err_msg=f"buffers differ from baseline (seed={seed})")
+      else:
+        match = all(np.array_equal(a, b) for a, b in zip(buffers, test_buffers, strict=True))
+        assert not match, f"buffers match baseline unexpectedly (seed={seed})"
     return val, buffers
 
   print('capture + replay')
@@ -251,9 +288,48 @@ def compile_jit(jit, input_keys, make_queues, make_random_inputs=None, benchmark
     dump_oob(jit, f)
     f.seek(0)
     loaded_jit = load_oob(f)
+
+  del jit
+  import gc
+  gc.collect()
+
   random_inputs_run(loaded_jit, SEED, benchmark_runs, test_val, test_buffers, expect_match=True)
   random_inputs_run(loaded_jit, SEED+1, benchmark_runs, test_val, test_buffers, expect_match=False)
-  return jit
+  return loaded_jit
+
+
+def _worker_compile_jit(result_queue, jit, inputs, queues_fn, make_random_inputs, benchmark_runs):
+  try:
+    loaded_jit = compile_jit(jit, inputs, queues_fn, make_random_inputs=make_random_inputs, benchmark_runs=benchmark_runs)
+    with tempfile.NamedTemporaryFile(dir=".", delete=False) as f:
+      dump_oob(loaded_jit, f)
+      temp_name = f.name
+    result_queue.put((True, temp_name))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+  except Exception as e:
+    result_queue.put((False, str(e)))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
+
+def compile_jit_isolated(jit, inputs, queues_fn, make_random_inputs=None, benchmark_runs=1):
+  ctx = mp.get_context("fork")
+  q = ctx.Queue()
+  p = ctx.Process(target=_worker_compile_jit, args=(q, jit, inputs, queues_fn, make_random_inputs, benchmark_runs))
+  p.start()
+  success, payload = q.get()
+  p.join()
+  if not success:
+    raise RuntimeError(f"Subprocess compilation failed: {payload}")
+  temp_name = payload
+  with open(temp_name, "rb") as f:
+    loaded_jit = load_oob(f)
+  if os.path.exists(temp_name):
+    os.unlink(temp_name)
+  return loaded_jit
 
 
 def _parse_size(size_str: str) -> tuple[int, int]:
@@ -264,9 +340,6 @@ def _parse_size(size_str: str) -> tuple[int, int]:
 def read_file_chunked_to_disk(path):
   if not path:
     return None
-  import atexit
-  import shutil
-  from openpilot.common.file_chunker import open_file_chunked
   tmp_path = f'{path}.unchunked'
   with open(tmp_path, 'wb') as f, open_file_chunked(path) as src:
     shutil.copyfileobj(src, f)
@@ -283,6 +356,29 @@ def _load_policy_runners(args: argparse.Namespace) -> tuple[list, list]:
   return runners, keys
 
 
+def make_metadata_dict(onnx_path):
+  from examples.openpilot.compile_onnx import onnx_metadata
+  metadata, output_shapes = onnx_metadata(onnx_path)
+  runner = OnnxRunner(onnx_path)
+  input_shapes = {name: tuple(d if isinstance(d, int) else 1 for d in spec.shape) for name, spec in runner.graph_inputs.items()}
+
+  output_slices = {}
+  offset = 0
+  for name in output_shapes.keys():
+    size = math.prod(d if isinstance(d, int) else 1 for d in output_shapes[name])
+    output_slices[name] = slice(offset, offset + size)
+    offset += size
+
+  if 'hidden_state' not in output_slices:
+    output_slices['hidden_state'] = slice(0, 512)
+
+  return {
+    'input_shapes': input_shapes,
+    'output_slices': output_slices,
+    'metadata_props': metadata
+  }
+
+
 if __name__ == "__main__":
   if 'USB' in os.getenv('DEV', '') or os.getenv('CHESTNUT'):
     from openpilot.system.hardware.chestnut.flash import link_up
@@ -292,11 +388,6 @@ if __name__ == "__main__":
       time.sleep(1)
     else:
       raise RuntimeError("Chestnut not ready, skipping big model build")
-
-  from openpilot.common.file_chunker import chunk_file, get_chunk_targets
-  from openpilot.selfdrive.modeld.get_model_metadata import make_metadata_dict
-  from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
-  from tinygrad.nn.onnx import OnnxRunner
 
   parser = argparse.ArgumentParser(description="Compile combined JIT pkl for sunnypilot modeld_v2")
   parser.add_argument('--model-type', choices=MODEL_TYPES, required=True)
@@ -322,30 +413,43 @@ if __name__ == "__main__":
   args.on_policy_onnx = read_file_chunked_to_disk(args.on_policy_onnx)
   args.supercombo_onnx = read_file_chunked_to_disk(args.supercombo_onnx)
 
+  is_unified_supercombo = False
   if args.model_type == 'supercombo':
     assert args.supercombo_onnx
     model_metadata = make_metadata_dict(args.supercombo_onnx)
+    derived_frame_skip = args.frame_skip or derive_frame_skip({}, model_metadata['input_shapes'])
+    if derived_frame_skip != 1 and os.getenv('CHESTNUT'):
+      is_unified_supercombo = True
+
+  if is_unified_supercombo:
     output_data['metadata'] = {'model': model_metadata, **model_metadata}
     output_data['input_devices'] = {'model': Device.DEFAULT}
     output_data['run_model'] = {}
-    derived_frame_skip = args.frame_skip or derive_frame_skip({}, model_metadata['input_shapes'])
     model_runner = OnnxRunner(args.supercombo_onnx)
-    run_policy = stock.make_run_policy(model_runner, model_metadata, derived_frame_skip)
-    for cam_w, cam_h in args.camera_resolutions:
+    features_slice = model_metadata['output_slices']['hidden_state']
+    run_policy = make_run_policy(None, [model_runner], features_slice, derived_frame_skip, model_metadata['input_shapes'])
+    for cam_w, cam_h in set(args.camera_resolutions):
       print(f"Compiling unified run_model JIT for {cam_w}x{cam_h}...")
       nv12 = stock.NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
       frame_copy_size = stock.nv12_copy_size(nv12.stride, nv12.y_height, nv12.uv_height)
       make_model_queues = partial(stock.make_input_queues, model_metadata['input_shapes'], derived_frame_skip,
                                   frame_copy_size=frame_copy_size)
       warp = stock.make_warp(nv12, model_w, model_h)
-      run_model_jit = TinyJit(stock.make_run_model(warp, run_policy, model_metadata, frame_copy_size), prune=True)
-      output_data['run_model'][(cam_w, cam_h)] = compile_jit(run_model_jit, stock.MODELD_INPUTS, make_model_queues, benchmark_runs=args.benchmark_runs)
+      run_model_func = stock.make_run_model(warp, run_policy, model_metadata, frame_copy_size)
+      output_data['run_model'][(cam_w, cam_h)] = compile_jit_isolated(
+        run_model_func, stock.MODELD_INPUTS, make_model_queues, benchmark_runs=args.benchmark_runs
+      )
   else:
     vision_runner = OnnxRunner(args.vision_onnx) if args.vision_onnx else None
+
     if args.model_type == 'vision_policy':
       assert vision_runner and args.policy_onnx
       policy_runners = [OnnxRunner(args.policy_onnx)]
       output_data['metadata'] = {'vision': make_metadata_dict(args.vision_onnx), 'policy': make_metadata_dict(args.policy_onnx)}
+    elif args.model_type == 'supercombo':
+      assert args.supercombo_onnx
+      policy_runners = [OnnxRunner(args.supercombo_onnx)]
+      output_data['metadata'] = {'model': make_metadata_dict(args.supercombo_onnx)}
     elif args.model_type == 'vision_multi_policy':
       assert vision_runner
       policy_runners, policy_names = _load_policy_runners(args)
@@ -360,24 +464,27 @@ if __name__ == "__main__":
 
     derived_frame_skip = args.frame_skip or derive_frame_skip(vision_meta.get('input_shapes', {}), first_policy_meta.get('input_shapes', {}))
     all_shapes = {key: value for meta in output_data['metadata'].values() for key, value in meta['input_shapes'].items()}
-    feat_meta = output_data['metadata'].get('vision') or output_data['metadata'].get('policy')
+    feat_meta = output_data['metadata'].get('vision') or output_data['metadata'].get('model') or output_data['metadata'].get('policy')
     assert feat_meta is not None
     features_slice = feat_meta['output_slices']['hidden_state']
+    is_supercombo = vision_runner is None
 
     print(f"Compiling run_policy JIT (model_size={model_w}x{model_h}, frame_skip={derived_frame_skip})...")
     run_policy_func = make_run_policy(vision_runner, policy_runners, features_slice, derived_frame_skip, all_shapes)
-    run_policy_jit = TinyJit(run_policy_func, prune=True)
-    make_policy_queues = partial(generate_queues_and_npy, all_shapes, derived_frame_skip, is_supercombo=False)
-    make_random_model_inputs = partial(make_random_images, keys=['warped'], shape=(2, 6, model_h // 2, model_w // 2), device=Device.DEFAULT)
-    output_data['run_policy'] = compile_jit(run_policy_jit, POLICY_INPUTS, make_policy_queues, make_random_inputs=make_random_model_inputs)
+    make_policy_queues = partial(generate_queues_and_npy, all_shapes, derived_frame_skip, is_supercombo=is_supercombo)
+    WARP_DEV = os.getenv('WARP_DEV', Device.DEFAULT)
+    make_random_model_inputs = partial(make_random_images, keys=['warped'], shape=(2, 6, model_h // 2, model_w // 2), device=WARP_DEV)
+    output_data['run_policy'] = compile_jit_isolated(run_policy_func, POLICY_INPUTS, make_policy_queues,
+                                            make_random_inputs=make_random_model_inputs, benchmark_runs=args.benchmark_runs)
 
-    for cam_w, cam_h in args.camera_resolutions:
+    for cam_w, cam_h in set(args.camera_resolutions):
       print(f"Compiling warp JIT for {cam_w}x{cam_h}...")
       nv12 = stock.NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
       frame_copy_size = stock.nv12_copy_size(nv12.stride, nv12.y_height, nv12.uv_height)
-      make_random_warp_inputs = partial(make_random_images, keys=['frame', 'big_frame'], shape=frame_copy_size, device=Device.DEFAULT)
-      warp = TinyJit(stock.make_warp(nv12, model_w, model_h), prune=True)
-      output_data[(cam_w, cam_h)] = compile_jit(warp, WARP_INPUTS, make_warp_queues, make_random_inputs=make_random_warp_inputs)
+      make_random_warp_inputs = partial(make_random_images, keys=['frame', 'big_frame'], shape=nv12.size, device=WARP_DEV)
+      warp_func = stock.make_warp(nv12, model_w, model_h)
+      output_data[(cam_w, cam_h)] = compile_jit_isolated(warp_func, WARP_INPUTS, make_warp_queues, make_random_inputs=make_random_warp_inputs,
+                                                benchmark_runs=args.benchmark_runs)
 
     output_data['metadata']['warp_dev'] = Device.DEFAULT
 

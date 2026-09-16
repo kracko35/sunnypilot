@@ -11,7 +11,9 @@ import pickle
 import inspect
 import importlib
 import enum
-
+# OptOps and UOp objects in the .pkl are left over from the compilation phase,
+# reassignment does nothing because they aren't tied to the execution graph
+# It never executes or evaluates the UOp nodes again.
 
 def _pad_args(func, args, kwargs):
   try:
@@ -36,23 +38,9 @@ def _pad_args(func, args, kwargs):
   return new_args, kwargs
 
 
-def _enum_factory(enum_class):
-  def factory(*args, **kwargs):
-    try:
-      return enum_class(*args, **kwargs)
-    # OptOps and UOp objects in the .pkl are left over from the compilation phase,
-    # reassignment does nothing because they aren't tied to the execution graph
-    # It never executes or evaluates the UOp nodes again.
-    except ValueError:
-      return list(enum_class)[0]
-  factory.__name__ = enum_class.__name__
-  factory.__module__ = enum_class.__module__
-  return factory
-
-
 def _dynamic_factory(real_class):
   if isinstance(real_class, type) and issubclass(real_class, enum.Enum):
-    return _enum_factory(real_class)
+    return real_class
 
   def factory(*args, **kwargs):
     try:
@@ -98,3 +86,17 @@ def load_oob(f):
       f.readinto(pb)
       yield pb
   return DynamicTinygradUnpickler(io.BytesIO(opcodes), buffers=buffers()).load()
+
+
+def dump_oob(obj, f):
+  buffers = []
+  def buffer_cb(buffer):
+    buffers.append(buffer)
+    return False
+
+  opcodes = pickle.dumps(obj, protocol=5, buffer_callback=buffer_cb)
+  f.write(struct.pack('<q', len(opcodes)))
+  f.write(opcodes)
+  for b in buffers:
+    f.write(struct.pack('<q', len(b.raw())))
+    f.write(b.raw())

@@ -2,6 +2,8 @@
 
 ## 目的と実機状況
 
+常用の既定bitrateは1000 kbit/s。ScreenStreamBitrateが未設定の場合だけ適用し、保存済みの1500などはそのまま使用する。Paramsキーの変更・migrationはない。利用者の最新報告では1000で約20fps、sender_drops=0、sendto_eagain_count=0、capture→UDP send約66～73ms、FFmpeg CPU約50%、socket outqも安定している。以下の過去の実測と比較用bitrateは履歴として保持する。
+
 comma 3X → Windows PCのunicastを基本候補とし、glass-to-glass 100ms以下を目標に計測と調整を行う実験版。100ms達成を保証するものではなく、本変更後の実機遅延は未測定。MIB・MOST・AIDは変更しない。H.264 / MPEG-TS / UDPを維持し、multicastも残す。
 
 最新の利用者報告（`7637bf720ff3f775a2f9b2a69f93556e1ca7b451`）では、定常区間のsender_dropsとsendto_eagain_countは0、socket_sndbufは229376。観測区間ではUDP混雑が解消している。以下は各window平均の概数で、端末間の表示遅延ではない。
@@ -63,7 +65,7 @@ ffmpeg -hide_banner -muxers 2>/dev/null | grep mpegts
 | --- | --- | --- | --- |
 | Destination Address | ScreenStreamAddress | 239.255.42.99 | 通常のIPv4 unicastまたは224.0.1.0～239.255.255.255 |
 | UDP Port | ScreenStreamPort | 12346 | 1～65535 |
-| Bitrate (kbit/s) | ScreenStreamBitrate | 1500 | 250～8000 |
+| Bitrate (kbit/s) | ScreenStreamBitrate | 1000 | 250～8000 |
 | Multicast TTL | ScreenStreamTtl | 1 | 1～255、unicastでは送信に使用しない |
 
 ScreenStreamEnabledの初期値はOFF。ON時だけ4項目を表示し、録画中は編集できない。保存値は再起動後も維持する。0/8、127/8、link-local、予約済みIPv4、255.255.255.255、224.0.0/24、IPv6、ホスト名、URL、ポート・クエリ付き入力は拒否する。サブネットごとのdirected broadcast判定は行わないので、PCのホストアドレスを指定する。

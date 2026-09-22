@@ -112,6 +112,18 @@ class TestScreenStreamSettings(unittest.TestCase):
     self.assertEqual(ScreenStreamConfig.from_params(self.params), ScreenStreamConfig('239.20.30.40', 23456, 3000, 2))
     self.assertEqual(settings.items['port'].value, '23456')
 
+  def test_bitrate_display_uses_default_or_preserves_saved_value(self):
+    for compact in [False, True]:
+      for saved, expected in [(None, '1000'), (1500, '1500')]:
+        with self.subTest(compact=compact, saved=saved):
+          self.params.values = {'ScreenStreamEnabled': True}
+          if saved is not None:
+            self.params.values['ScreenStreamBitrate'] = saved
+          before = self.params.values.copy()
+          settings = self.ui.ScreenStreamSettings(self.params, compact=compact)
+          self.assertEqual(settings.items['bitrate'].value, expected)
+          self.assertEqual(self.params.values, before)
+
   def test_invalid_save_preserves_previous_value_and_reopens_editor(self):
     self.params.values.update(ScreenStreamEnabled=True, ScreenStreamPort=12346)
     settings = self.ui.ScreenStreamSettings(self.params)

@@ -26,7 +26,7 @@ Development stays on `udp-screen-streaming`. Future upstream PRs target master; 
 | --- | --- | --- |
 | Destination Address / 送信先アドレス | 通常のIPv4 unicast、または / ordinary IPv4 unicast, or multicast 224.0.1.0–239.255.255.255 | 239.255.42.99 |
 | UDP Port | 1–65535 | 12346 |
-| Bitrate (kbit/s) | 250–8000 | 1500 |
+| Bitrate (kbit/s) | 250–8000 | 1000 |
 | Multicast TTL | 1–255（unicastでは無視 / ignored for unicast） | 1 |
 
 既存Param名と既定値は維持し、保存済みのunicast宛先もそのまま使用します。0/8、loopback、link-local、予約済みIPv4、限定broadcast、224.0.0/24、IPv6、ホスト名、URL、ポートやクエリ付き入力は拒否します。英語UI原文を本家の`tr`／`tr_noop`とPOで翻訳し、既存の12言語を使用します。

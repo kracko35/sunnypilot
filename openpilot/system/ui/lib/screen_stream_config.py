@@ -19,7 +19,7 @@ PARAM_KEYS = {
 class ScreenStreamConfig:
   address: str = '239.255.42.99'
   port: int = 12346
-  bitrate: int = 1500
+  bitrate: int = 1000
   ttl: int = 1
 
   def __post_init__(self):

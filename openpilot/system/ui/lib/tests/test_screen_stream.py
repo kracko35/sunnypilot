@@ -265,7 +265,7 @@ class TestScreenStreamer(unittest.TestCase):
       message = next(call.args[0] for call in self.cloudlog.info.call_args_list if 'screen stream latency stats:' in call.args[0])
       for field in ['capture_count=1', 'submitted_count=1', 'frames_written=1', 'capture_avg_ms=20.0', 'readback_max_ms=15.0',
                     'queue_replaced_count=', 'stale_drop_count=', 'queue_age_avg_ms=', 'stdin_write_max_ms=', 'pid=',
-                    'mode=multicast', 'bitrate=1500', 'sender_datagrams=', 'sender_drops=', 'sender_bytes=',
+                    'mode=multicast', 'bitrate=1000', 'sender_datagrams=', 'sender_drops=', 'sender_bytes=',
                     'socket_sndbuf=', 'socket_outq_current=', 'socket_outq_peak=', 'first_frame_written=1',
                     'first_frame_write_ms=', 'first_frame_blocked_wait_ms=', 'process_start_to_first_frame_complete_ms=',
                     'first_frame_write_timeout_count=0', 'regular_frame_write_timeout_count=0']:
@@ -287,13 +287,13 @@ class TestScreenStreamer(unittest.TestCase):
     wait_until(self.streamer.ready.is_set)
     old_observer = self.streamer._latency
     self.streamer.stats.record({'capture_count': 3}, capture=.004)
-    self.config.return_value = ScreenStreamConfig(bitrate=1000)
+    self.config.return_value = ScreenStreamConfig(bitrate=500)
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
     finals = [call.args[0] for call in self.cloudlog.info.call_args_list if 'screen stream latency final:' in call.args[0]]
     self.assertEqual(len(finals), 1)
     self.assertIn('config changed', finals[0])
     self.assertIn('capture_count=3', finals[0])
-    self.assertIn('bitrate=1500', finals[0])
+    self.assertIn('bitrate=1000', finals[0])
     self.assertIn('encoder_pes_samples=0', finals[0])
     self.assertIn('diag_pending_max=0', finals[0])
     self.assertIn('observer_parse_calls=0', finals[0])
@@ -697,7 +697,7 @@ class TestScreenStreamer(unittest.TestCase):
         wait_until(lambda: self.streamer.stats.snapshot()['frames_written'] == 1)
         self.assertGreaterEqual(self.streamer._first_frame_metrics['first_frame_write_ms'], 120)
         if generation == 0:
-          self.config.return_value = ScreenStreamConfig(bitrate=1000)
+          self.config.return_value = ScreenStreamConfig(bitrate=500)
         elif generation == 1:
           self.network.return_value = ('wlan0', '192.168.1.9')
       self.assertEqual(self.streamer._restart_count, 0)
@@ -901,7 +901,7 @@ class TestCommand(unittest.TestCase):
     self.assertEqual(command[-1], 'pipe:1')
     self.assertEqual(command[command.index('-i') + 1], 'pipe:0')
     self.assertFalse(any(value in ' '.join(command) for value in ['udp://', 'localaddr', 'ttl', 'pkt_size', '239.255', '12346']))
-    self.assertEqual(command, stream.ffmpeg_command(ScreenStreamConfig('239.2.3.4', 23456, 1500, 2)))
+    self.assertEqual(command, stream.ffmpeg_command(ScreenStreamConfig('239.2.3.4', 23456, 1000, 2)))
 
   def test_bitrate_controls_encoder(self):
     command = stream.ffmpeg_command(ScreenStreamConfig(bitrate=3000))
@@ -1121,7 +1121,7 @@ class TestMpegTsUdpSender(unittest.TestCase):
   def test_unicast_ignores_multicast_ttl(self):
     for ttl in [1, 255]:
       with self.subTest(ttl=ttl):
-        config = ScreenStreamConfig('10.0.0.20', 12346, 1500, ttl)
+        config = ScreenStreamConfig('10.0.0.20', 12346, 1000, ttl)
         self.assertEqual(self.run_sender([b'A' * 1316], config), b'A' * 1316)
         self.assertEqual(stream.ffmpeg_command(config), stream.ffmpeg_command())
 
@@ -1384,6 +1384,15 @@ class TestCachedQueriesAndStats(unittest.TestCase):
 
 
 class TestStreamConfig(unittest.TestCase):
+  def test_default_bitrate_only_applies_when_not_saved(self):
+    self.assertEqual(ScreenStreamConfig().bitrate, 1000)
+    params = Mock()
+    params.get.return_value = None
+    self.assertEqual(ScreenStreamConfig.from_params(params).bitrate, 1000)
+    params.get.side_effect = {'ScreenStreamBitrate': 1500}.get
+    self.assertEqual(ScreenStreamConfig.from_params(params).bitrate, 1500)
+    params.put.assert_not_called()
+
   def test_missing_keys_use_defaults_and_saved_values_are_loaded(self):
     params = Mock()
     params.get.return_value = None

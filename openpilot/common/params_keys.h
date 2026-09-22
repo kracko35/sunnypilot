@@ -12,7 +12,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ScreenStreamEnabled", {PERSISTENT, BOOL, "0"}},
     {"ScreenStreamAddress", {PERSISTENT, STRING, "239.255.42.99"}},
     {"ScreenStreamPort", {PERSISTENT, INT, "12346"}},
-    {"ScreenStreamBitrate", {PERSISTENT, INT, "1500"}},
+    {"ScreenStreamBitrate", {PERSISTENT, INT, "1000"}},
     {"ScreenStreamTtl", {PERSISTENT, INT, "1"}},
     {"ApiCache_Device", {PERSISTENT, STRING}},
     {"ApiCache_FirehoseStats", {PERSISTENT, JSON}},

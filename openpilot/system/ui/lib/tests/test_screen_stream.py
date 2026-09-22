@@ -2,6 +2,7 @@
 
 import errno
 import os
+from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import replace
 import subprocess
@@ -1384,6 +1385,13 @@ class TestCachedQueriesAndStats(unittest.TestCase):
 
 
 class TestStreamConfig(unittest.TestCase):
+  def test_native_parameter_defaults_match_config(self):
+    header = (Path(__file__).resolve().parents[5] / 'openpilot/common/params_keys.h').read_text(encoding='utf-8')
+    defaults = ScreenStreamConfig()
+    for field, key in PARAM_KEYS.items():
+      declaration = next(line for line in header.splitlines() if f'"{key}"' in line)
+      self.assertIn(f'"{getattr(defaults, field)}"', declaration)
+
   def test_default_bitrate_only_applies_when_not_saved(self):
     self.assertEqual(ScreenStreamConfig().bitrate, 1000)
     params = Mock()

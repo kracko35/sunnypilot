@@ -1,5 +1,7 @@
 """配信の排他・復旧・遅延制限を実機なしで検証する。"""
 
+import os
+from dataclasses import replace
 import subprocess
 import time
 import unittest
@@ -27,17 +29,31 @@ class TestScreenStreamer(unittest.TestCase):
     self.streamer.visible.set()
     self.processes = []
     self.commands = []
+    self.senders = []
+    self.sender_class = stream.MpegTsMulticastSender
+    self.stdout_factory = Mock
+    set_blocking = os.set_blocking
+
+    def sender(*args):
+      transport = Mock()
+      transport.done.is_set.return_value = False
+      transport.error = None
+      transport.arguments = args
+      self.senders.append(transport)
+      return transport
 
     def process(*args, **kwargs):
       self.commands.append(args[0])
       proc = Mock()
       proc.poll.return_value = None
       proc.stdin.fileno.return_value = 42
+      proc.stdout = self.stdout_factory()
       self.processes.append(proc)
       return proc
 
     for target, kwargs in [
-      ('subprocess.Popen', {'side_effect': process}), ('os.set_blocking', {}),
+      ('subprocess.Popen', {'side_effect': process}), ('MpegTsMulticastSender', {'side_effect': sender}),
+      ('os.set_blocking', {'side_effect': lambda fd, blocking: None if fd == 42 else set_blocking(fd, blocking)}),
       ('select.select', {'return_value': ([], [], [])}),
       ('NETWORK_INTERVAL', {'new': 0.02}), ('RETRY_INTERVAL', {'new': 0.03}),
     ]:
@@ -57,6 +73,7 @@ class TestScreenStreamer(unittest.TestCase):
     self.network.assert_not_called()
     self.config.assert_not_called()
     self.assertEqual(self.processes, [])
+    self.assertEqual(self.senders, [])
 
   def test_live_settings_restart_once_with_new_destination(self):
     self.enabled = True
@@ -65,7 +82,10 @@ class TestScreenStreamer(unittest.TestCase):
     self.config.return_value = ScreenStreamConfig('239.10.20.30', 15000, 3000, 2)
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
     self.processes[0].terminate.assert_called_once()
-    self.assertEqual(self.commands[-1][-1], 'udp://239.10.20.30:15000?pkt_size=1316&ttl=2&localaddr=192.168.1.8')
+    self.assertEqual(self.commands[-1][-1], 'pipe:1')
+    self.assertEqual(self.senders[-1].arguments[1:], ('192.168.1.8', self.config.return_value))
+    self.senders[0].stop.assert_called_once()
+    self.senders[0].close.assert_called_once()
     self.assertEqual(self.commands[-1][self.commands[-1].index('-b:v') + 1], '3000k')
     time.sleep(0.1)
     self.assertEqual(len(self.processes), 2)
@@ -85,7 +105,7 @@ class TestScreenStreamer(unittest.TestCase):
     self.streamer.start()
     self.enabled = True
     wait_until(self.streamer.ready.is_set)
-    self.assertIn(':23456?', self.commands[0][-1])
+    self.assertEqual(self.senders[0].arguments[2].port, 23456)
 
   def test_wifi_disconnect_reconnect_address_change_and_toggle(self):
     self.enabled = True
@@ -101,11 +121,17 @@ class TestScreenStreamer(unittest.TestCase):
     first.terminate.assert_called_once()
     self.network.return_value = ('wlan0', '192.168.2.8')
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+    self.assertEqual(self.senders[-1].arguments[1], '192.168.2.8')
     self.network.return_value = ('wlan1', '192.168.2.9')
-    wait_until(lambda: len(self.processes) == 3)
+    wait_until(lambda: len(self.processes) == 3 and self.streamer.ready.is_set())
+    self.assertEqual(self.senders[-1].arguments[1], '192.168.2.9')
     self.enabled = False
     wait_until(lambda: not self.streamer.ready.is_set())
     self.processes[-1].terminate.assert_called_once()
+    self.senders[-1].close.assert_called_once()
+    self.network.reset_mock()
+    time.sleep(0.15)
+    self.network.assert_not_called()
 
   def test_screen_off_stops_and_wake_restarts(self):
     self.enabled = True
@@ -115,6 +141,7 @@ class TestScreenStreamer(unittest.TestCase):
     wait_until(lambda: not self.streamer.ready.is_set())
     self.streamer.visible.set()
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+    self.senders[0].close.assert_called_once()
 
   def test_encoder_exit_restarts(self):
     self.enabled = True
@@ -132,6 +159,70 @@ class TestScreenStreamer(unittest.TestCase):
     self.processes[0].terminate.assert_called_once()
     self.network.side_effect = None
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+
+  def test_each_transport_setting_and_interface_change_restarts(self):
+    self.enabled = True
+    self.streamer.start()
+    wait_until(self.streamer.ready.is_set)
+    for field, value in [('address', '239.2.3.4'), ('port', 23456), ('ttl', 2), ('bitrate', 2500)]:
+      with self.subTest(field=field):
+        count = len(self.processes)
+        self.config.return_value = replace(self.config.return_value, **{field: value})
+        wait_until(lambda count=count: len(self.processes) == count + 1 and self.streamer.ready.is_set())
+        self.assertEqual(self.senders[-1].arguments[2], self.config.return_value)
+        self.senders[-2].close.assert_called_once()
+    self.network.return_value = ('wlan1', '192.168.1.8')
+    wait_until(lambda: len(self.processes) == 6 and self.streamer.ready.is_set())
+    self.senders[-2].close.assert_called_once()
+
+  def test_socket_failure_stops_encoder_and_restarts_transport(self):
+    writers, transports, sockets = [], [], []
+
+    def stdout():
+      read_fd, write_fd = os.pipe()
+      writers.append(write_fd)
+      self.addCleanup(os.close, write_fd)
+      pipe = os.fdopen(read_fd, 'rb', buffering=0)
+      self.addCleanup(pipe.close)
+      return pipe
+
+    def sender(*args):
+      transport = self.sender_class(*args)
+      transports.append(transport)
+      return transport
+
+    def socket(*args):
+      sock = Mock()
+      sock.sendto.side_effect = OSError('UDP送信障害')
+      sockets.append(sock)
+      return sock
+
+    self.stdout_factory = stdout
+    self.enabled = True
+    with patch.object(stream, 'MpegTsMulticastSender', side_effect=sender), patch.object(stream.socket, 'socket', side_effect=socket):
+      self.streamer.start()
+      try:
+        wait_until(self.streamer.ready.is_set)
+        os.write(writers[0], b'\x47' * 188)
+        wait_until(lambda: len(transports) == 2 and self.streamer.ready.is_set())
+        self.assertIsInstance(transports[0].error, OSError)
+        self.assertFalse(transports[0]._thread.is_alive())
+        self.processes[0].terminate.assert_called_once()
+        self.assertTrue(self.processes[0].stdout.closed)
+        sockets[0].close.assert_called()
+      finally:
+        self.streamer.close()
+      self.assertTrue(all(not transport._thread.is_alive() for transport in transports))
+      self.assertTrue(all(proc.stdout.closed for proc in self.processes))
+
+  def test_sender_eof_stops_encoder_and_retries(self):
+    self.enabled = True
+    self.streamer.start()
+    wait_until(self.streamer.ready.is_set)
+    self.senders[0].done.is_set.return_value = True
+    wait_until(lambda: len(self.senders) == 2 and self.streamer.ready.is_set())
+    self.processes[0].terminate.assert_called_once()
+    self.senders[0].close.assert_called_once()
 
   def test_missing_ffmpeg_is_retried(self):
     self.enabled = True
@@ -181,6 +272,23 @@ class TestScreenStreamer(unittest.TestCase):
     self.streamer._close_process()
     proc.kill.assert_called_once()
     proc.stdin.close.assert_called_once()
+    proc.stdout.close.assert_called_once()
+
+  def test_cleanup_releases_transport_even_if_kill_wait_fails(self):
+    proc = self.streamer._proc = Mock()
+    sender = self.streamer._sender = Mock()
+    proc.poll.return_value = None
+    proc.wait.side_effect = subprocess.TimeoutExpired('ffmpeg', 0.2)
+    self.streamer.ready.set()
+    self.streamer.submit(bytes(stream.FRAME_BYTES))
+    self.assertRaises(subprocess.TimeoutExpired, self.streamer._close_process)
+    self.assertFalse(self.streamer.ready.is_set())
+    self.assertTrue(self.streamer._frames.empty())
+    proc.kill.assert_called_once()
+    proc.stdin.close.assert_called_once()
+    proc.stdout.close.assert_called_once()
+    sender.stop.assert_called_once()
+    sender.close.assert_called_once()
 
   def test_close_releases_an_idle_encoder(self):
     self.enabled = True
@@ -227,10 +335,93 @@ class TestWifiAddress(unittest.TestCase):
 
 
 class TestCommand(unittest.TestCase):
-  def test_binds_to_wifi_and_limits_multicast(self):
-    command = stream.ffmpeg_command('192.168.1.8')
-    self.assertEqual(command[-1], 'udp://239.255.42.99:12346?pkt_size=1316&ttl=1&localaddr=192.168.1.8')
-    self.assertRaises(ValueError, stream.ffmpeg_command, 'host?ttl=255')
+  def test_uses_only_pipes_and_ignores_network_settings(self):
+    command = stream.ffmpeg_command()
+    self.assertEqual(command[-1], 'pipe:1')
+    self.assertEqual(command[command.index('-i') + 1], 'pipe:0')
+    self.assertFalse(any(value in ' '.join(command) for value in ['udp://', 'localaddr', 'ttl', 'pkt_size', '239.255', '12346']))
+    self.assertEqual(command, stream.ffmpeg_command(ScreenStreamConfig('239.2.3.4', 23456, 1500, 2)))
+
+  def test_bitrate_controls_encoder(self):
+    command = stream.ffmpeg_command(ScreenStreamConfig(bitrate=3000))
+    for flag, value in [('-b:v', '3000k'), ('-maxrate', '3000k'), ('-bufsize', '1000k')]:
+      self.assertEqual(command[command.index(flag) + 1], value)
+
+
+class TestMpegTsMulticastSender(unittest.TestCase):
+  def run_sender(self, chunks, config=stream.DEFAULT_CONFIG):
+    sock = Mock()
+    sock.sendto.side_effect = lambda payload, destination: len(payload)
+    with patch.object(stream.socket, 'socket', return_value=sock) as create, \
+         patch.object(stream.os, 'set_blocking'), patch.object(stream.os, 'read', side_effect=[*chunks, b'']):
+      sender = stream.MpegTsMulticastSender(Mock(), '192.168.4.38', config)
+      sender.start()
+      try:
+        self.assertTrue(sender.done.wait(2))
+      finally:
+        sender.close()
+      self.assertIsNone(sender.error)
+      self.assertFalse(sender._thread.is_alive())
+    create.assert_called_once_with(stream.socket.AF_INET, stream.socket.SOCK_DGRAM, stream.socket.IPPROTO_UDP)
+    sock.setsockopt.assert_any_call(stream.socket.IPPROTO_IP, stream.socket.IP_MULTICAST_IF, stream.socket.inet_aton('192.168.4.38'))
+    sock.setsockopt.assert_any_call(stream.socket.IPPROTO_IP, stream.socket.IP_MULTICAST_TTL, config.ttl)
+    sock.bind.assert_not_called()
+    sock.close.assert_called()
+    calls = sock.sendto.call_args_list
+    self.assertTrue(all(call.args[1] == (config.address, config.port) for call in calls))
+    packets = [call.args[0] for call in calls]
+    self.assertTrue(all(0 < len(packet) <= 1316 and len(packet) % 188 == 0 for packet in packets))
+    return b''.join(packets)
+
+  def test_irregular_reads_preserve_all_ts_bytes(self):
+    ts = b''.join(b'\x47' + bytes([i % 256]) * 187 for i in range(200))
+    chunks, offset, sizes = [], 0, [1, 500, 4096, 187, 1316, 2]
+    while offset < len(ts):
+      size = sizes[len(chunks) % len(sizes)]
+      chunks.append(ts[offset:offset + size])
+      offset += size
+    self.assertEqual(self.run_sender(chunks, ScreenStreamConfig('239.10.20.30', 15000, 3000, 2)), ts)
+
+  def test_eof_drops_only_incomplete_packet(self):
+    ts = b'\x47' * (188 * 9)
+    for tail in [b'', b'X', b'X' * 187]:
+      with self.subTest(tail=len(tail)):
+        self.assertEqual(self.run_sender([ts + tail]), ts)
+    self.assertEqual(self.run_sender([b'X' * 187]), b'')
+
+  def test_idle_stdout_close_is_bounded(self):
+    read_fd, write_fd = os.pipe()
+    self.addCleanup(os.close, write_fd)
+    with os.fdopen(read_fd, 'rb', buffering=0) as stdout, patch.object(stream.socket, 'socket') as create:
+      sender = stream.MpegTsMulticastSender(stdout, '127.0.0.1', ScreenStreamConfig())
+      sender.start()
+      start = time.monotonic()
+      sender.close()
+      self.assertLess(time.monotonic() - start, 0.5)
+      self.assertFalse(sender._thread.is_alive())
+      self.assertIsNone(sender.error)
+      create.return_value.close.assert_called()
+
+  def test_socket_setup_failure_closes_socket(self):
+    with patch.object(stream.socket, 'socket') as create:
+      create.return_value.setsockopt.side_effect = OSError('インターフェース消失')
+      self.assertRaises(OSError, stream.MpegTsMulticastSender, Mock(), '192.168.4.38', ScreenStreamConfig())
+      create.return_value.close.assert_called_once()
+
+  def test_socket_timeout_and_read_error_are_reported(self):
+    for read_error in [False, True]:
+      with self.subTest(read_error=read_error), patch.object(stream.socket, 'socket') as create, \
+           patch.object(stream.os, 'set_blocking'), patch.object(stream.os, 'read') as read:
+        read.side_effect = OSError('パイプ障害') if read_error else [b'\x47' * 188]
+        create.return_value.sendto.side_effect = TimeoutError('送信期限超過')
+        sender = stream.MpegTsMulticastSender(Mock(), '192.168.4.38', ScreenStreamConfig())
+        sender.start()
+        try:
+          self.assertTrue(sender.done.wait(2))
+        finally:
+          sender.close()
+        self.assertIsInstance(sender.error, OSError)
+        create.return_value.close.assert_called()
 
 
 class TestStreamConfig(unittest.TestCase):

@@ -1,8 +1,8 @@
 # sunnypilot
 
-[sunnypilot](https://github.com/sunnypilot/sunnypilot) のUIを、Wi-Fi上のUDPマルチキャストで配信する開発用forkです。録画経路のRenderTextureを共有し、H.264映像をMPEG-TSとして送信します。MIB / MOST / AID側の変更は含みません。
+[sunnypilot](https://github.com/sunnypilot/sunnypilot) のUIを、Wi-Fi上のUDPマルチキャストで配信する開発用forkです。録画経路のRenderTextureを共有し、FFmpegのMPEG-TS標準出力をPythonのUDP socketで送信します。MIB / MOST / AID側の変更は含みません。
 
-A development fork of [sunnypilot](https://github.com/sunnypilot/sunnypilot) that streams its UI over Wi-Fi using UDP multicast, H.264 and MPEG-TS. It shares the recorder's RenderTexture capture path. MIB / MOST / AID receiver changes are outside this repository.
+A development fork of [sunnypilot](https://github.com/sunnypilot/sunnypilot) that streams its UI over Wi-Fi using UDP multicast, H.264 and MPEG-TS. It shares the recorder's RenderTexture capture path and sends FFmpeg's MPEG-TS stdout through a Python UDP socket. MIB / MOST / AID receiver changes are outside this repository.
 
 ## ブランチ / Branches
 
@@ -48,6 +48,18 @@ TTLは同一ネットワーク内なら1を使用します。無効な入力は�
 
 Use TTL 1 for the local network. Invalid input is rejected. Only multicast IPv4 destinations are accepted; unicast IPs, hostnames and URLs are not supported. Rebuild after updating to register the new parameter keys.
 
+## 送信経路 / Transport
+
+```text
+UI RGBA → FFmpeg stdin → libx264 / MPEG-TS → stdout (pipe:1)
+                                               ↓
+                                  Python socket → UDP multicast
+```
+
+comma 3Xで確認された標準FFmpegは`file`と`pipe`のみをサポートするため、FFmpegのUDPプロトコルには依存しません。必要なのは`libx264`、`mpegts`、`pipe`です。Python標準ライブラリだけでWi-FiインターフェースとTTLを設定し、専用スレッドで送信します。各UDPペイロードは188 bytesの整数倍・最大1316 bytesです。この上限はPython側で制御します。
+
+The standard FFmpeg build reported on comma 3X supports only `file` and `pipe`, so streaming does not depend on FFmpeg's UDP protocol. It requires `libx264`, `mpegts`, and `pipe`. A dedicated thread uses Python's standard library to set the Wi-Fi multicast interface and TTL and send the data. Python limits each UDP payload to a multiple of 188 bytes, up to 1316 bytes.
+
 ## 配信仕様 / Stream settings
 
 | 項目 / Item | 値 / Value |
@@ -73,9 +85,9 @@ The stream is unencrypted and unauthenticated. Enabling it exposes the UI, inclu
 
 ## 検証と開発 / Validation and development
 
-Windows開発PCで単体テストとGPU・FFmpeg・ループバックUDPマルチキャストの統合テストを実行済みです。comma 3X上のビルド、負荷・温度・実遅延、実Wi-FiとMIB / MOST / AID表示は未検証です。
+Windows開発PCで単体テストとGPU・FFmpeg標準出力・Python socket・ループバックUDPマルチキャストの統合テストを実行済みです。統合テストのエンコーダには`file,pipe`だけを許可しています。comma 3X上のビルド、負荷・温度・実遅延、実Wi-FiとMIB / MOST / AID表示は未検証です。
 
-Unit tests and GPU / FFmpeg / loopback UDP multicast integration tests have been run on a Windows development PC. Device builds, comma 3X load, temperature, end-to-end latency, real Wi-Fi, and MIB / MOST / AID display remain unverified.
+Unit tests and GPU / FFmpeg stdout / Python socket / loopback UDP multicast integration tests have been run on a Windows development PC. The integration-test encoder permits only the `file,pipe` protocols. Device builds, comma 3X load, temperature, end-to-end latency, real Wi-Fi, and MIB / MOST / AID display remain unverified.
 
 [実装仕様・ビルド・実機テスト手順 / Implementation, build and device-test guide (Japanese)](docs/ui_udp_stream.md)
 

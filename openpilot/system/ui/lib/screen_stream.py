@@ -5,10 +5,12 @@ import logging
 import os
 import queue
 import select
+import socket
 import subprocess
 import threading
 import time
 from collections.abc import Callable
+from typing import BinaryIO
 from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
 
 WIDTH, HEIGHT, FPS = 800, 480, 20
@@ -19,6 +21,8 @@ PORT = DEFAULT_CONFIG.port
 NETWORK_INTERVAL = 1.0
 RETRY_INTERVAL = 3.0
 WRITE_TIMEOUT = 0.25
+TS_PACKET_SIZE = 188
+UDP_PAYLOAD_SIZE = TS_PACKET_SIZE * 7
 logger = logging.getLogger(__name__)
 
 
@@ -64,9 +68,8 @@ def wifi_address() -> tuple[str, str] | None:
   return None
 
 
-def ffmpeg_command(address: str, config: ScreenStreamConfig = DEFAULT_CONFIG) -> list[str]:
-  """検証済みの設定を使い、Wi-FiのローカルIPv4を送信元に指定する。"""
-  local_address = str(ipaddress.IPv4Address(address))
+def ffmpeg_command(config: ScreenStreamConfig = DEFAULT_CONFIG) -> list[str]:
+  """エンコードとMPEG-TSのパイプ出力だけを行い、ネットワーク設定には依存しない。"""
   return [
     'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', '-nostats',
     '-f', 'rawvideo', '-pixel_format', 'rgba', '-video_size', f'{WIDTH}x{HEIGHT}', '-framerate', str(FPS), '-i', 'pipe:0',
@@ -75,8 +78,68 @@ def ffmpeg_command(address: str, config: ScreenStreamConfig = DEFAULT_CONFIG) ->
     '-bf', '0', '-g', '10', '-keyint_min', '10', '-sc_threshold', '0', '-x264-params', 'repeat-headers=1',
     '-b:v', f'{config.bitrate}k', '-maxrate', f'{config.bitrate}k', '-bufsize', f'{max(1, config.bitrate // 3)}k',
     '-f', 'mpegts', '-mpegts_flags', '+resend_headers', '-muxdelay', '0', '-muxpreload', '0', '-flush_packets', '1',
-    f'udp://{config.address}:{config.port}?pkt_size=1316&ttl={config.ttl}&localaddr={local_address}',
+    'pipe:1',
   ]
+
+
+class MpegTsMulticastSender:
+  """FFmpegのstdoutを専用スレッドで読み、TS境界を保ってWi-Fiへ送信する。"""
+  def __init__(self, stdout: BinaryIO, local_address: str, config: ScreenStreamConfig):
+    self._stdout = stdout
+    self._destination = (config.address, config.port)
+    self._stop = threading.Event()
+    self.done = threading.Event()
+    self.error: Exception | None = None
+    self._thread = threading.Thread(target=self._run, name="ui-screen-multicast", daemon=True)
+    self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+      self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_address))
+      self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, config.ttl)
+      self._socket.settimeout(0.1)
+      os.set_blocking(stdout.fileno(), False)
+    except Exception:
+      self._socket.close()
+      raise
+
+  def start(self):
+    self._thread.start()
+
+  def stop(self):
+    self._stop.set()
+
+  def close(self):
+    self.stop()
+    if self._thread.is_alive():
+      self._thread.join(timeout=0.5)
+    self._socket.close()
+    if self._thread.is_alive():
+      raise TimeoutError("画面配信の送信スレッドを停止できません")
+
+  def _run(self):
+    pending = bytearray()
+    try:
+      while not self._stop.is_set():
+        try:
+          chunk = os.read(self._stdout.fileno(), 65536)
+        except BlockingIOError:
+          self._stop.wait(0.01)
+          continue
+        if not chunk:
+          # EOFの188 bytes未満の端数は不完全なTSパケットなので送信しない。
+          return
+        pending.extend(chunk)
+        while len(pending) >= TS_PACKET_SIZE and not self._stop.is_set():
+          size = min(len(pending) // TS_PACKET_SIZE * TS_PACKET_SIZE, UDP_PAYLOAD_SIZE)
+          payload = bytes(pending[:size])
+          if self._socket.sendto(payload, self._destination) != size:
+            raise OSError("画面配信のUDPデータグラムを送信できません")
+          del pending[:size]
+    except Exception as error:
+      if not self._stop.is_set():
+        self.error = error
+    finally:
+      self._socket.close()
+      self.done.set()
 
 
 class ScreenStreamer:
@@ -91,6 +154,7 @@ class ScreenStreamer:
     self._stop = threading.Event()
     self._thread = threading.Thread(target=self._run, name="ui-screen-stream", daemon=True)
     self._proc: subprocess.Popen | None = None
+    self._sender: MpegTsMulticastSender | None = None
 
   def start(self):
     self._thread.start()
@@ -113,9 +177,12 @@ class ScreenStreamer:
 
   def _close_process(self):
     self.ready.clear()
-    if self._proc is not None:
-      proc, self._proc = self._proc, None
-      try:
+    proc, self._proc = self._proc, None
+    sender, self._sender = self._sender, None
+    if sender is not None:
+      sender.stop()
+    try:
+      if proc is not None:
         if proc.poll() is None:
           proc.terminate()
         try:
@@ -123,19 +190,35 @@ class ScreenStreamer:
         except subprocess.TimeoutExpired:
           proc.kill()
           proc.wait(timeout=0.2)
+    finally:
+      try:
+        if proc is not None:
+          try:
+            if proc.stdin is not None:
+              proc.stdin.close()
+          finally:
+            if proc.stdout is not None:
+              proc.stdout.close()
       finally:
-        if proc.stdin is not None:
-          proc.stdin.close()
-    try:
-      self._frames.get_nowait()
-    except queue.Empty:
-      pass
+        try:
+          if sender is not None:
+            sender.close()
+        finally:
+          try:
+            self._frames.get_nowait()
+          except queue.Empty:
+            pass
+
+  def _check_sender(self):
+    if self._sender is not None and self._sender.done.is_set():
+      raise BrokenPipeError("画面配信のMPEG-TS送信が停止しました") from self._sender.error
 
   def _write_frame(self, captured: float, data: bytes):
     assert self._proc is not None and self._proc.stdin is not None
     remaining = memoryview(data)
     deadline = captured + WRITE_TIMEOUT
     while remaining:
+      self._check_sender()
       if self._stop.is_set() or not self.visible.is_set() or time.monotonic() >= deadline:
         # rawvideoの途中を破棄すると次フレームの境界が壊れるため、プロセスごと再開する。
         raise TimeoutError("画面配信の書き込み期限を超過しました")
@@ -157,7 +240,7 @@ class ScreenStreamer:
     last_error = 0.0
     try:
       if hasattr(os, 'sched_setscheduler'):
-        # UIのリアルタイム優先度をエンコーダへ継承させない。
+        # UIのリアルタイム優先度をエンコーダと送信スレッドへ継承させない。
         os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
         os.setpriority(os.PRIO_PROCESS, 0, 10)
       while not self._stop.is_set():
@@ -183,12 +266,16 @@ class ScreenStreamer:
             continue
           if self._proc is not None and self._proc.poll() is not None:
             raise BrokenPipeError("画面配信のFFmpegが終了しました")
+          self._check_sender()
           if self._proc is None:
             if now < next_retry:
               self._stop.wait(0.1)
               continue
-            self._proc = subprocess.Popen(ffmpeg_command(current_network[1], current_config), stdin=subprocess.PIPE, bufsize=0)
+            self._proc = subprocess.Popen(ffmpeg_command(current_config), stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+            assert self._proc.stdin is not None and self._proc.stdout is not None
             os.set_blocking(self._proc.stdin.fileno(), False)
+            self._sender = MpegTsMulticastSender(self._proc.stdout, current_network[1], current_config)
+            self._sender.start()
             self.ready.set()
           try:
             captured, data = self._frames.get(timeout=0.05)

@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from openpilot.system.ui.lib.screen_stream import WIDTH, HEIGHT, FRAME_BYTES, ffmpeg_command
+from openpilot.system.ui.lib.screen_stream import WIDTH, HEIGHT, FRAME_BYTES, MpegTsMulticastSender, ffmpeg_command
 from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
 
 
@@ -49,11 +49,17 @@ class TestScreenStreamVideo(unittest.TestCase):
 
     with tempfile.TemporaryDirectory() as directory:
       output = str(Path(directory) / 'screen.ts')
-      command = ffmpeg_command('127.0.0.1', config)
-      command[0], command[-1] = ffmpeg, output
+      command = ffmpeg_command(config)
+      command[0] = ffmpeg
+      # 開発PCにUDP対応FFmpegがあっても、エンコードにはfile/pipe以外を許可しない。
+      command[1:1] = ['-protocol_whitelist', 'file,pipe']
+      self.assertEqual(command[-1], 'pipe:1')
+      self.assertNotIn('udp://', ' '.join(command))
       encoded = subprocess.run(command, input=data * 20, capture_output=True, timeout=20)
       self.assertEqual(encoded.returncode, 0, encoded.stderr.decode(errors='replace'))
-      ts = Path(output).read_bytes()
+      ts = encoded.stdout
+      Path(output).write_bytes(ts)
+      self.assertEqual(len(ts) % 188, 0)
       self.assertTrue(all(ts[offset] == 0x47 for offset in range(0, len(ts), 188)))
       decoded = subprocess.run([ffmpeg, '-i', output, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
                                capture_output=True, timeout=20)
@@ -61,6 +67,8 @@ class TestScreenStreamVideo(unittest.TestCase):
       self.assertEqual(len(decoded.stdout), WIDTH * HEIGHT * 3)
       self.assertIn(b'Constrained Baseline', decoded.stderr)
       self.assertIn(b'20 fps', decoded.stderr)
+      self.assertIn(b'yuv420p', decoded.stderr)
+      self.assertEqual(command[command.index('-bf') + 1], '0')
 
       def pixel(x, y):
         offset = (y * WIDTH + x) * 3
@@ -73,7 +81,7 @@ class TestScreenStreamVideo(unittest.TestCase):
       self.assertLess(pixel(400, 350)[0], 80)
       self.assertLess(max(pixel(400, 470)), 10)
 
-      # 本番と同じUDP URLを使い、ループバック上のマルチキャストだけで送受信する。
+      # 本番のPython送信クラスを使い、FFmpegのstdoutからループバックへ送信する。
       packets = []
       stopped = threading.Event()
       with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as receiver:
@@ -95,16 +103,61 @@ class TestScreenStreamVideo(unittest.TestCase):
         reader = threading.Thread(target=receive)
         reader.start()
         try:
-          command = ffmpeg_command('127.0.0.1', config)
-          command[0] = ffmpeg
-          sent = subprocess.run(command, input=data * 20, capture_output=True, timeout=20)
-          self.assertEqual(sent.returncode, 0, sent.stderr.decode(errors='replace'))
+          with tempfile.TemporaryFile() as stderr:
+            proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, bufsize=0)
+            sender = MpegTsMulticastSender(proc.stdout, '127.0.0.1', config)
+            writer_errors = []
+
+            def write_frames():
+              try:
+                for _ in range(20):
+                  remaining = memoryview(data)
+                  while remaining:
+                    written = proc.stdin.write(remaining)
+                    if not written:
+                      raise BrokenPipeError('統合テストの入力パイプが閉じられました')
+                    remaining = remaining[written:]
+              except Exception as error:
+                writer_errors.append(error)
+              finally:
+                proc.stdin.close()
+
+            writer = threading.Thread(target=write_frames)
+            try:
+              sender.start()
+              writer.start()
+              proc.wait(timeout=20)
+              writer.join(timeout=1)
+              self.assertFalse(writer.is_alive())
+              self.assertEqual(writer_errors, [])
+              self.assertTrue(sender.done.wait(2))
+              self.assertIsNone(sender.error)
+              stderr.seek(0)
+              self.assertEqual(proc.returncode, 0, stderr.read().decode(errors='replace'))
+            finally:
+              sender.stop()
+              if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+              if writer.ident is not None:
+                writer.join(timeout=2)
+              proc.stdin.close()
+              proc.stdout.close()
+              sender.close()
+            self.assertFalse(sender._thread.is_alive())
         finally:
           stopped.set()
           reader.join(timeout=2)
         self.assertFalse(reader.is_alive())
       self.assertTrue(packets, 'UDPマルチキャストを受信できませんでした')
       self.assertTrue(all(len(packet) <= 1316 and len(packet) % 188 == 0 for packet in packets))
+      self.assertTrue(all(packet[offset] == 0x47 for packet in packets for offset in range(0, len(packet), 188)))
+      inspected = subprocess.run([ffmpeg, '-protocol_whitelist', 'file,pipe', '-f', 'mpegts', '-i', 'pipe:0',
+                                  '-vf', 'showinfo', '-f', 'null', '-'], input=b''.join(packets), capture_output=True, timeout=20)
+      self.assertEqual(inspected.returncode, 0, inspected.stderr.decode(errors='replace'))
+      frame_info = [line for line in inspected.stderr.splitlines() if b'Parsed_showinfo' in line and b' type:' in line]
+      self.assertEqual(len(frame_info), 20)
+      self.assertFalse(any(b'type:B' in line for line in frame_info))
       received = subprocess.run([ffmpeg, '-f', 'mpegts', '-i', 'pipe:0', '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
                                 input=b''.join(packets), capture_output=True, timeout=20)
       self.assertEqual(received.returncode, 0, received.stderr.decode(errors='replace'))

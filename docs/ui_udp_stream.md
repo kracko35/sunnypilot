@@ -28,7 +28,7 @@ git push origin udp-screen-streaming
 
 ## 実装
 
-- `system/ui/lib/screen_stream.py`: 接続Wi-Fiの取得、FFmpegプロセス管理、最新フレームの待ち行列、書き込み期限、再試行。
+- `system/ui/lib/screen_stream.py`: 接続Wi-Fiの取得、FFmpegプロセス管理、最新フレームの待ち行列、書き込み期限、再試行。`MpegTsMulticastSender`が標準出力の読み取り・TS分割・Python socketでの送信を担当する。
 - `system/ui/lib/screen_capture.py`: 録画と共有するRGBA読み出し、GPUでの縮小、20fpsへの間引き。
 - `system/ui/lib/application.py`: 必要時のみRenderTextureを確保し、画面描画後に配信キャプチャを行う。`RECORD=1`の場合は配信ワーカーを起動しない。
 - `selfdrive/ui/ui.py`: 通常UIから配信機能を登録。他のGUIツールや録画専用ツールには配信を自動登録しない。
@@ -50,7 +50,7 @@ git push origin udp-screen-streaming
 
 アドレスはマルチキャスト専用で、ユニキャストIP・ホスト名・URL・224.0.0.0/24の制御用アドレスは受け付けない。TTLは同一ネットワーク内では1を使用する。設定は再起動後も保持し、OFFにしても値を消去しない。解像度800×480と最大20fpsは固定。
 
-`screen_stream_config.py`の検証をUI入力と配信バックエンドで共用する。無効な入力は保存せず、翻訳されたエラーと入力範囲を表示して再入力を求める。キャンセル時は値を変更しない。設定は通常1秒周期のワーカー側チェックで反映し、変更時に古いFFmpegと待機フレームを破棄して再起動する。本体UIの再起動は不要。新しいキーを登録するため、この更新を初めて導入するときはネイティブライブラリの再ビルドが必要。
+`screen_stream_config.py`の検証をUI入力と配信バックエンドで共用する。無効な入力は保存せず、翻訳されたエラーと入力範囲を表示して再入力を求める。キャンセル時は値を変更しない。設定は通常1秒周期のワーカー側チェックで反映し、変更時に古いFFmpeg・送信スレッド・socket・待機フレームを解放し、エンコーダと送信処理を再生成する。本体UIの再起動は不要。新しいキーを登録するため、この更新を初めて導入するときはネイティブライブラリの再ビルドが必要。
 
 共通UIは`system/ui/widgets/screen_stream_settings.py`に置き、comma 3Xでは標準のリストとKeyboard、小画面UIではBigButtonとBigInputDialogを使用する。翻訳の原文は同ファイルの`tr_noop`で抽出でき、テンプレートは`selfdrive/ui/translations/app.pot`、翻訳は`app_*.po`へ格納する。配信設定の文字列は12言語すべてに翻訳を収録する。以後の更新は本家の`python -m openpilot.selfdrive.ui.translations.update_translations`を使用できる。
 
@@ -60,7 +60,9 @@ git push origin udp-screen-streaming
 通常UIのRenderTexture
   ├─ 本体画面
   └─ GPUで800×480へ縮小（縦横比保持・黒帯）
-       └─ RGBA読み出し → 最新1フレーム → FFmpeg
+       └─ RGBA読み出し → 最新1フレーム → FFmpeg stdin
+            → libx264 / MPEG-TS → stdout (pipe:1)
+            → 専用送信スレッド → Python socket → UDPマルチキャスト
 ```
 
 2160×1080のフル画面をCPUへ読み出す代わりに800×480で読み出す。20fps時の生RGBA転送量は約30.72 MB/sで、フル解像度の約186.62 MB/sより小さい。これは画素数からの計算で、実測値ではない。
@@ -69,15 +71,32 @@ OpenGLの上下方向は縮小描画時とFFmpegの`vflip`で揃える。FPS表�
 
 ### エンコードと送信
 
-固定設定は800×480、最大20fps、libx264 baseline / yuv420p、Bフレームなし、GOP 10、`veryfast`、`zerolatency`。ビットレートは設定値を使い、VBVはその約1/3とする。SPS/PPSを繰り返し、MPEG-TSで送信する。既定値は1500 kbit/s、VBV 500 kbit、宛先`239.255.42.99:12346`、TTL 1。UDPペイロードは最大1316 bytes。
+固定設定は800×480、最大20fps、libx264 baseline / yuv420p、Bフレームなし、GOP 10、`veryfast`、`zerolatency`。ビットレートは設定値を使い、VBVはその約1/3とする。SPS/PPSを繰り返し、MPEG-TSで送信する。既定値は1500 kbit/s、VBV 500 kbit、宛先`239.255.42.99:12346`、TTL 1。UDPペイロードはPython側で最大1316 bytesに制限する。FFmpeg URLの`pkt_size`オプションは使用しない。
 
-Wi-Fiの判定は、NetworkManagerの接続済みWi-Fiデバイス、インフラストラクチャモード、有効なIPv4の組み合わせで行う。デフォルトルートが携帯回線でもWi-Fiが接続済みなら配信できる。`localaddr`で送信インターフェースをWi-Fi側に指定する。Wi-Fiインターフェース名やIPv4が変わればFFmpegを作り直す。
+Wi-Fiの判定は、NetworkManagerの接続済みWi-Fiデバイス、インフラストラクチャモード、有効なIPv4の組み合わせで行う。デフォルトルートが携帯回線でもWi-Fiが接続済みなら配信できる。Pythonの`socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)`を使い、`IP_MULTICAST_IF`へWi-FiのIPv4を、`IP_MULTICAST_TTL`へ設定値を指定する。`bind`は使用しない。Wi-Fiインターフェース名・IPv4・宛先・ポート・ビットレート・TTLのいずれかが変われば、FFmpegとsocketを作り直す。
 
-UIスレッドはFFmpegへ直接書かない。ワーカーが非ブロッキングパイプを使い、取得から250ms以内にフレームを書き切れなければプロセスを再起動する。書きかけのrawvideoを途中で捨てて次フレームへ継ぎ足すことはしない。ワーカーと子プロセスにはUIのリアルタイム優先度を継承させず、エンコーダのスレッド数も2に制限する。
+UIスレッドはFFmpegへ直接書かない。ワーカーが非ブロッキングパイプを使い、取得から250ms以内にフレームを書き切れなければプロセスを再起動する。書きかけのrawvideoを途中で捨てて次フレームへ継ぎ足すことはしない。ワーカーのスケジューラとniceを変更した後にFFmpegと送信スレッドを生成し、UIのリアルタイム優先度を継承させない。エンコーダのスレッド数も2に制限する。
 
 Wi-Fiを通常1秒周期で確認する。OFF・消灯は通常100ms以内に確認し、処理中の照会・書き込み・子プロセス終了処理分の遅延が加わる。障害後は約3秒待って再試行する。これらは処理の期限であり、端末間の映像遅延を保証する値ではない。
 
-OFF時はWi-Fi照会もFFmpeg起動も行わず、配信専用のGPUリソースを解放する。表示用・録画用に必要なRenderTextureは維持する。
+OFF時はWi-Fi照会・FFmpeg・socketを動作させず、配信専用のGPUリソースを解放する。表示用・録画用に必要なRenderTextureは維持する。
+
+### FFmpegのパイプ出力と送信スレッド
+
+実機から報告されたcomma 3Xの標準FFmpegは、入力・出力ともに`file`と`pipe`のみを提供する。`libx264`と`mpegts`は利用できるが、FFmpegの`udp`プロトコルは利用できない。このためエンコードと送信を分離する。
+
+```text
+FFmpeg出力の変更前: udp://ADDRESS:PORT?pkt_size=1316&ttl=TTL&localaddr=LOCALADDR
+FFmpeg出力の変更後: pipe:1
+```
+
+`ffmpeg_command(config)`は送信元アドレスを引数に取らず、宛先・ポート・TTLもコマンドへ渡さない。エンコード条件は維持する。標準入力・標準出力を`subprocess.PIPE`、`bufsize=0`で開き、stderrは従来どおり継承する。
+
+ワーカーはRGBAをstdinへ書き、別の送信スレッドがstdoutを常時読み出す。読み書きを同じスレッドで処理しないため、stdoutの満杯でエンコーダが停止し、stdin書き込みまで停止する循環待ちを防ぐ。stdoutは非ブロッキング読み取り、socketは100msの送信タイムアウトを使用する。
+
+読み取り境界とTSパケット境界は一致しない。読み取ったデータを一時バッファへ追記し、188 bytesの整数倍・最大1316 bytesずつ順序どおり`sendto()`する。187 bytes以下の端数を次の読み取りへ保持し、EOF時の不完全なパケットは送信しない。通常の完全なTSストリームに欠落・重複・並べ替えを加えない。
+
+送信スレッドの例外は保持してワーカーへ通知し、元の例外を原因としてログへ出す。stdoutのEOFも停止として検出する。障害時はreadyを解除して送信停止を通知し、FFmpegをterminate、200msで終了しなければkillしてさらに200ms待つ。stdin/stdoutを閉じ、送信スレッドを最大500msでjoinし、socketとフレーム待ち行列を解放する。約3秒後に再試行する。消灯やOFFでも同じ後片付けを行い、点灯・ON時は自動再開する。
 
 ## comma 3Xでの準備
 
@@ -100,9 +119,18 @@ git remote -v
 ```sh
 python -c 'from openpilot.common.params import Params; print(Params().get_bool("ScreenStreamEnabled"))'
 ffmpeg -hide_banner -encoders | grep libx264
-ffmpeg -hide_banner -protocols | grep udp
+ffmpeg -hide_banner -protocols | grep pipe
 ffmpeg -hide_banner -muxers | grep mpegts
 ```
+
+送信側のFFmpegに`udp`プロトコルは不要。設定の読み取り・Wi-Fi判定・エンコーダ起動は次のコマンドでも確認できる。配信をONにして画面を点灯させてからプロセスを確認する。
+
+```sh
+python -c 'from openpilot.common.params import Params; from openpilot.system.ui.lib.screen_stream import wifi_address; from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig; p = Params(); print(p.get_bool("ScreenStreamEnabled")); print(ScreenStreamConfig.from_params(p)); print(wifi_address())'
+pgrep -af ffmpeg
+```
+
+FFmpegの出力先が`pipe:1`であり、プロセスがすぐに終了しないことを確認する。受信PCではREADMEのFFplayコマンドで映像を確認する。受信側FFplayのUDP機能は引き続き必要。OFFや消灯でFFmpegが終了し、再開時に復帰することも確認する。
 
 設定画面から「UDP Screen Streaming」（日本語では「UDP画面配信」）をONにする。SSHから設定する場合は次の操作が同等。ONにすると設定画面を含め同じLANへ画面が公開される。
 
@@ -142,19 +170,20 @@ SCREEN_STREAM_TEST_GPU=1 python -m unittest \
   openpilot.system.ui.lib.tests.test_screen_stream_video -v
 ```
 
-GPU統合テストはOpenGLコンテキストとFFmpeg、ループバック上のUDPマルチキャストを必要とする。通常はスキップされる。FFmpegのパスを個別に指定する場合は`SCREEN_STREAM_TEST_FFMPEG`を使用する。合成した赤青の画像だけをPC内で送受信し、本物のUIやカメラ映像は使わない。
+GPU統合テストはOpenGLコンテキストとFFmpeg、ループバック上のUDPマルチキャストを必要とする。通常はスキップされる。FFmpegのパスを個別に指定する場合は`SCREEN_STREAM_TEST_FFMPEG`を使用する。エンコーダには`-protocol_whitelist file,pipe`を指定し、FFmpegのUDP対応に依存しないことを確認する。GPU→FFmpeg stdout→本番のPython送信クラス→ループバック受信→復号の経路で、合成した赤青の画像だけをPC内で送受信し、本物のUIやカメラ映像は使わない。
 
 2026-09-22の開発PCでの結果:
 
-- Python 3.12、Windows、Raylib 6.1-dev、FFmpeg 7.1で36テスト成功。
+- Python 3.12、Windows、Raylib 6.1-dev、FFmpeg 7.1で単体テスト44件とGPU統合テスト2件が成功。
+- 不規則なstdout読み取り境界からのTS再構成、EOF端数破棄、socket設定、送信・読み取り障害の通知、送信スレッド終了を確認。
 - 無効時の無通信、最新フレームへの置き換え、Wi-Fi切断・再接続・IP変更、D-Bus障害、FFmpeg欠落・終了・書き込み停止からの復旧を確認。
-- GPU縮小・上下方向・黒帯、H.264 baseline / 800×480 / 20fps、188 bytes単位のMPEG-TS、最大1316 bytesの実UDPマルチキャスト送受信と復号を確認。
+- GPU縮小・上下方向・黒帯、H.264 Constrained Baseline / 800×480 / 20fps / yuv420p / Bフレームなし、188 bytes単位のMPEG-TS、最大1316 bytesの実UDPマルチキャスト送受信と復号を確認。
 - Ruffによる変更Pythonファイルの検査を実施。
-- 既定値に加え、別のアドレス・ポート・2600 kbit/s・TTL 2でもGPU→FFmpeg→UDP→復号を確認。
+- 既定値に加え、別のアドレス・ポート・2600 kbit/s・TTL 2でもGPU→FFmpeg stdout→Python socket→UDP→復号を確認。
 - 設定の境界値・不正値・URL文字列拒否・保存とキャンセル・録画中の編集無効化・OFF時の非表示・送信先変更時の再起動を確認。
 - 本家のPOローダーで12言語の翻訳収録を確認し、英語から日本語への切替と表示更新を検証。
 
-これらはcomma 3Xでの実測・本体ビルド・本家CI全体の成功を意味しない。Windowsには本家のLinuxネイティブ依存が揃わないため、本体UI全体の起動テストは未実施。
+実機からはParamsの保存値とWi-Fi検出（wlan0）が正常で、標準FFmpegのUDP非対応によりエンコーダが即終了することが報告されている。本修正後のcomma 3X上での配信動作は未確認。開発PCの結果はcomma 3Xでの実測・本体ビルド・本家CI全体の成功を意味しない。Windowsには本家のLinuxネイティブ依存が揃わないため、本体UI全体の起動テストは未実施。
 
 ## 実機テスト記録
 

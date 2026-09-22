@@ -91,7 +91,7 @@ class FrameTimingRecord:
 
 
 class FrameTimingObserver:
-  """入力/PES数が釣り合う小区間だけ確定する。同期喪失後は次のプロセスまで計測を休止する。"""
+  """整合性検査を通った先頭recordから確定する。順序対応は映像identityの証明ではない。"""
   def __init__(self, clock=time.monotonic):
     self.clock = clock
     self.parser = TsPesParser()
@@ -101,6 +101,11 @@ class FrameTimingObserver:
     self._datagrams = deque()
     self._last_sequence = -1
     self._last_pts = self._last_start = None
+    self._anchor_start = None
+    self._pts_elapsed = 0.0
+    self._pending_max = 0
+    self._parse_calls = 0
+    self._parse_total = self._parse_max = 0.0
     self.active = True
     self.reason = 'none'
     self._counts = dict.fromkeys(('encoder_pes_samples', 'pes_events', 'diag_sync_lost', 'frame_first_datagram_drop_count'), 0)
@@ -134,9 +139,11 @@ class FrameTimingObserver:
       record = FrameTimingRecord(sequence, captured_at, dequeued_at, started_at)
       self._records.append(record)
       self._unpaired.append(record)
+      self._pending_max = max(self._pending_max, len(self._records))
 
   def complete(self, sequence, completed_at, success=True):
     with self._lock:
+      self._expire(completed_at)
       if not self.active:
         return
       if (not success or not self._records or self._records[-1].sequence != sequence
@@ -144,11 +151,23 @@ class FrameTimingObserver:
         self._lose('incomplete_input')
         return
       self._records[-1].stdin_completed_at = completed_at
-      self._commit_if_balanced()
+      self._commit_ready_prefix()
 
   def observe(self, chunk, observed_at):
     if not self.active:
       return
+    # chunk単位で解析・対応検査を計測する。TS packet単位の時計読み取りは追加しない。
+    started = time.perf_counter()
+    try:
+      self._observe(chunk, observed_at)
+    finally:
+      elapsed = time.perf_counter() - started
+      with self._lock:
+        self._parse_calls += 1
+        self._parse_total += elapsed
+        self._parse_max = max(self._parse_max, elapsed)
+
+  def _observe(self, chunk, observed_at):
     # 解析はsenderだけで行い、入力側が待つロックの外に置く。
     try:
       events = self.parser.feed(chunk, observed_at)
@@ -177,6 +196,13 @@ class FrameTimingObserver:
           if not 0 < gap <= PTS_GAP_LIMIT or abs(gap - input_gap) > PTS_INPUT_TOLERANCE:
             self._lose('pts_discontinuity')
             return
+          self._pts_elapsed += gap
+          # 隣接gapだけでなく初回対応からの累積ずれも検査する。wrapは上の差分で展開済み。
+          if abs(self._pts_elapsed - (record.stdin_started_at - self._anchor_start)) > PTS_INPUT_TOLERANCE:
+            self._lose('pts_input_drift')
+            return
+        else:
+          self._anchor_start = record.stdin_started_at
         self._last_pts, self._last_start = event.pts, record.stdin_started_at
         record.pes = event
         self._datagrams.append(record)
@@ -192,6 +218,7 @@ class FrameTimingObserver:
     if first.pes.packet_offset >= end:
       return
     with self._lock:
+      self._expire(returned_at)
       while self._datagrams and self._datagrams[0].pes.packet_offset < end:
         record = self._datagrams.popleft()
         if record.pes.packet_offset < start:
@@ -202,13 +229,17 @@ class FrameTimingObserver:
           self._lose('send_timestamps')
           return
         record.sent_at, record.dropped = returned_at, not sent
-      self._commit_if_balanced()
+      self._commit_ready_prefix()
 
-  def _commit_if_balanced(self):
-    # 欠落で後続PESを一つ前へ仮対応しても、未対応入力が残る間は値を公開しない。
-    if self._unpaired or any(r.stdin_completed_at is None or r.sent_at is None for r in self._records):
-      return
-    for record in self._records:
+  def _commit_ready_prefix(self):
+    # 後続の未対応入力は正常なpipeline depthとして許容する。全体drainは待たない。
+    # TS/PTS・入力時刻・datagram検査済みでも、初回からの一定frame shiftは完全検出できない。
+    # 固定FFmpeg構成のmarker復号試験で順序前提を検証し、本番のidentity証明とは区別する。
+    while self.active and self._records:
+      record = self._records[0]
+      if record.pes is None or record.stdin_completed_at is None or record.sent_at is None:
+        break
+      self._records.popleft()
       pes = record.pes.observed_at
       self._counts['encoder_pes_samples'] += 1
       self._samples['capture_to_pes'].append(pes - record.captured_at)
@@ -220,7 +251,6 @@ class FrameTimingObserver:
       else:
         self._samples['pes_to_send'].append(record.sent_at - pes)
         self._samples['capture_to_udp_send'].append(record.sent_at - record.captured_at)
-    self._records.clear()
 
   def snapshot(self, now, elapsed, final=False):
     with self._lock:
@@ -230,7 +260,13 @@ class FrameTimingObserver:
       result = self._counts.copy()
       self._counts = dict.fromkeys(self._counts, 0)
       samples, self._samples = self._samples, {key: deque(maxlen=MAX_SAMPLES) for key in STAGES}
-      result.update(diag_active=int(self.active), diag_reason=self.reason, diag_pending=len(self._records))
+      result.update(diag_active=int(self.active), diag_reason=self.reason, diag_pending=len(self._records), diag_pending_max=self._pending_max,
+                    observer_parse_calls=self._parse_calls, observer_parse_total_ms=round(self._parse_total * 1000, 3),
+                    observer_parse_avg_us=round(self._parse_total * 1e6 / self._parse_calls, 3) if self._parse_calls else 0.0,
+                    observer_parse_max_us=round(self._parse_max * 1e6, 3))
+      self._pending_max = len(self._records)
+      self._parse_calls = 0
+      self._parse_total = self._parse_max = 0.0
     for key, values in samples.items():
       values = sorted(values)
       result[key + '_samples'] = len(values)

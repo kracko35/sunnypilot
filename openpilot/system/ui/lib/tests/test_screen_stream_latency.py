@@ -90,7 +90,7 @@ class TestFrameTimingObserver(unittest.TestCase):
     self.assertEqual(result['stdin_complete_to_pes_avg_ms'], -5)
     self.assertEqual(result['stdin_start_to_pes_avg_ms'], 8)
 
-  def test_missing_input_output_does_not_publish_shifted_pair(self):
+  def test_initial_constant_shift_is_not_proven_by_order_and_gap_checks(self):
     self.observer.begin(0, 0, 0, 0)
     self.observer.complete(0, .004)
     self.observer.begin(1, .05, .05, .05)
@@ -99,12 +99,169 @@ class TestFrameTimingObserver(unittest.TestCase):
     self.observer.observe(packet(4500), .06)
     self.observer.datagram(0, 188, .061, True)
     result = self.observer.snapshot(.1, .1)
-    self.assertEqual(result['encoder_pes_samples'], 0)
-    self.assertEqual(result['diag_pending'], 2)
+    # 初回からの一定shiftは検出不能。この順序前提の限界を成功条件として隠さない。
+    self.assertEqual(result['encoder_pes_samples'], 1)
+    self.assertEqual(result['diag_pending'], 1)
+    self.assertEqual(result['capture_to_pes_avg_ms'], 60)
     result = self.observer.snapshot(2.1, 2)
     self.assertEqual(result['diag_sync_lost'], 1)
     self.assertEqual(result['diag_reason'], 'pending_timeout')
     self.assertIsNone(result['stdin_start_to_pes_avg_ms'])
+
+  def pipeline(self, delay, *, frames=240, fault=None, wrap=False, close_with_tail=False):
+    events = []
+    for i in range(frames):
+      at = i * .05
+      events.extend([(at, 0, i), (at + .004, 1, i), (at + delay, 2, i), (at + delay + .002, 3, i)])
+    events.extend((at, 4, 0) for at in (5, 10))
+    windows, peak, last_window = [], 0, 0
+    stop_at = (frames - 1) * .05 + .004 if close_with_tail else float('inf')
+    for at, kind, i in sorted(events):
+      if at > stop_at:
+        break
+      if kind == 0:
+        self.observer.begin(i, at, at, at)
+      elif kind == 1:
+        self.observer.complete(i, at)
+      elif kind == 2:
+        pts = ((1 << 33) - 45000 if wrap else 0) + i * 4500
+        data = packet(pts % (1 << 33), i % 16)
+        if fault and i == 120:
+          if fault == 'continuity':
+            data = packet(pts, (i + 2) % 16)
+          elif fault in ('duplicate', 'backward'):
+            data = packet(pts - (4500 if fault == 'duplicate' else 9000), i % 16)
+          elif fault == 'unexpected':
+            data = b''.join(packet(pts + j * 4500, (i + j) % 16) for j in range(33))
+        self.observer.observe(data, at)
+        if not self.observer.active:
+          return windows, self.observer.snapshot(at, at - last_window), peak
+      elif kind == 3:
+        self.observer.datagram(i * 188, (i + 1) * 188, at, True, attempted_at=at - .001)
+      else:
+        windows.append(self.observer.snapshot(at, at - last_window))
+        last_window = at
+      peak = max(peak, len(self.observer._records))
+      self.assertTrue(self.observer.active)
+      self.assertLess(len(self.observer._records), latency.MAX_PENDING)
+    end = stop_at if close_with_tail else (frames - 1) * .05 + delay + .003
+    return windows, self.observer.snapshot(end, end - last_window, final=True), peak
+
+  def check_pipeline(self, delay):
+    windows, final, peak = self.pipeline(delay)
+    self.assertEqual(sum(w['encoder_pes_samples'] for w in [*windows, final]), 240)
+    self.assertGreater(windows[0]['encoder_pes_samples'], 80)
+    self.assertEqual(windows[1]['encoder_pes_samples'], 100)
+    self.assertEqual(windows[1]['frames_paired_per_sec'], 20)
+    self.assertLessEqual(peak, int(delay / .05 + 1.01))
+    self.assertEqual(final['diag_pending'], 0)
+    for w in [*windows, final]:
+      self.assertEqual(w['diag_active'], 1)
+      self.assertEqual(w['diag_sync_lost'], 0)
+      self.assertLess(w['diag_pending_max'], latency.MAX_PENDING)
+      for stage, expected in (('capture_to_pes', delay * 1000), ('stdin_start_to_pes', delay * 1000),
+                              ('stdin_complete_to_pes', delay * 1000 - 4), ('pes_to_send_attempt', 1),
+                              ('pes_to_send', 2), ('capture_to_udp_send', delay * 1000 + 2)):
+        for stat in ('avg', 'p95', 'max'):
+          self.assertAlmostEqual(w[f'{stage}_{stat}_ms'], expected, places=3)
+
+  def test_steady_pipeline_20ms_240_frames(self):
+    self.check_pipeline(.020)
+
+  def test_steady_pipeline_80ms_240_frames(self):
+    self.check_pipeline(.080)
+
+  def test_steady_pipeline_100ms_240_frames(self):
+    self.check_pipeline(.100)
+
+  def test_steady_pipeline_300ms_240_frames(self):
+    self.check_pipeline(.300)
+
+  def test_steady_pipeline_800ms_240_frames(self):
+    self.check_pipeline(.800)
+
+  def test_steady_pipeline_faults_stop_only_diagnostics(self):
+    for fault, reason in [('continuity', 'ts_continuity'), ('unexpected', 'unexpected_pes'),
+                          ('duplicate', 'pts_discontinuity'), ('backward', 'pts_discontinuity')]:
+      with self.subTest(fault=fault):
+        self.observer = latency.FrameTimingObserver()
+        windows, result, _ = self.pipeline(.8, fault=fault)
+        self.assertGreater(windows[0]['encoder_pes_samples'], 0)
+        self.assertEqual(result['diag_active'], 0)
+        self.assertEqual(result['diag_sync_lost'], 1)
+        self.assertEqual(result['diag_reason'], reason)
+        self.observer.observe(packet(), 20)
+        self.assertEqual(self.observer.snapshot(20, 1)['encoder_pes_samples'], 0)
+
+  def test_steady_pipeline_wrap_and_final_unfinished_tail(self):
+    windows, final, _ = self.pipeline(.8, wrap=True)
+    self.assertEqual(sum(w['encoder_pes_samples'] for w in [*windows, final]), 240)
+    self.assertEqual(final['diag_sync_lost'], 0)
+    self.observer = latency.FrameTimingObserver()
+    windows, final, _ = self.pipeline(.8, close_with_tail=True)
+    self.assertGreater(final['encoder_pes_samples'], 0)
+    self.assertEqual(final['capture_to_pes_avg_ms'], 800)
+    self.assertEqual(final['diag_reason'], 'unfinished_at_close')
+    self.assertEqual(sum(w['encoder_pes_samples'] for w in [*windows, final]), 224)
+
+  def test_cumulative_pts_drift_rejects_small_adjacent_drift(self):
+    for i in range(5):
+      self.frame(i, 1 + i * .05, pts=i * 7200)
+    result = self.observer.snapshot(1.3, .3)
+    self.assertEqual(result['diag_reason'], 'pts_input_drift')
+    self.assertEqual(result['diag_sync_lost'], 1)
+
+  def test_constant_shift_with_contiguous_ts_can_remain_undetectable(self):
+    self.observer.begin(0, 0, 0, 0)
+    self.observer.complete(0, .004)
+    for i in range(1, 201):
+      at = i * .05
+      self.observer.begin(i, at, at, at)
+      self.observer.complete(i, at + .004)
+      # 元frame 0がmux前で消えた場合を模擬し、TS連続性は正常のままにする。
+      self.observer.observe(packet(i * 4500, (i - 1) % 16), at + .010)
+      self.observer.datagram((i - 1) * 188, i * 188, at + .012, True)
+    result = self.observer.snapshot(10.02, 10.02)
+    self.assertEqual(result['diag_active'], 1)
+    self.assertEqual(result['encoder_pes_samples'], 200)
+    self.assertEqual(result['diag_pending'], 1)
+    self.assertEqual(result['capture_to_pes_avg_ms'], 60)
+
+  def test_expired_record_is_not_committed_by_late_send_or_completion(self):
+    for late in ('send', 'completion'):
+      self.observer = latency.FrameTimingObserver()
+      self.observer.begin(0, 0, 0, 0)
+      self.observer.observe(packet(), .01)
+      if late == 'send':
+        self.observer.complete(0, .005)
+        self.observer.datagram(0, 188, 2.1, True)
+      else:
+        self.observer.datagram(0, 188, .012, True)
+        self.observer.complete(0, 2.1)
+      result = self.observer.snapshot(2.2, 2.2)
+      self.assertEqual(result['encoder_pes_samples'], 0)
+      self.assertEqual(result['diag_reason'], 'pending_timeout')
+
+  def test_parse_cost_is_per_chunk_reset_and_inactive_has_no_timer(self):
+    self.observer.begin(0, 0, 0, 0)
+    with patch.object(latency.time, 'perf_counter', side_effect=[1, 1.00002, 2, 2.00004]) as clock:
+      self.observer.observe(packet()[:100], .01)
+      self.observer.observe(packet()[100:], .02)
+      self.assertEqual(clock.call_count, 4)
+    result = self.observer.snapshot(.03, .03)
+    self.assertEqual(result['observer_parse_calls'], 2)
+    self.assertEqual(result['observer_parse_total_ms'], .06)
+    self.assertEqual(result['observer_parse_avg_us'], 30)
+    self.assertEqual(result['observer_parse_max_us'], 40)
+    self.assertEqual(result['diag_pending_max'], 1)
+    result = self.observer.snapshot(.04, .01)
+    self.assertEqual(result['observer_parse_calls'], 0)
+    self.assertEqual(result['observer_parse_max_us'], 0)
+    self.assertEqual(result['diag_pending_max'], 1)
+    self.observer.complete(0, .05, success=False)
+    with patch.object(latency.time, 'perf_counter') as clock:
+      self.observer.observe(packet(), .06)
+      clock.assert_not_called()
 
   def test_pts_duplicate_backwards_and_large_jump_disable_pairing(self):
     for pts in (4500, 0, 900000):

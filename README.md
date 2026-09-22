@@ -104,9 +104,13 @@ The 75 ms and 100 ms limits apply to separate stages and do not guarantee a tota
 
 Device reports for `fe6f5b329` show roughly 800 ms at 500 kbit/s and 1300 ms at 1500. Actual SO_SNDBUF was 32768 with an outq peak of 33280 and substantial EAGAIN drops, while qdisc backlog and drop counters were zero. This revision replaces 188-byte datagrams and the forced 16 KiB send buffer. Device improvements after this change remain unmeasured.
 
-実UI配信では小さいTS/PES observerにより、capture→PES初観測→その先頭TSを含むUDP送信までを計測します。入力順序・PTS・TS連続性を検査し、入力数とPES数が釣り合う区間だけ確定します。未確定記録は最大32件・2秒、stage標本は最大200件。同期を失った場合はdiag_active=0として次のFFmpegプロセスまで対応付けを休止し、配信は継続します。映像保存・再復号・本番UIへの識別子描画は行いません。
+実UI配信では小さいTS/PES observerにより、capture→PES初観測→その先頭TSを含むUDP送信までを計測します。入力順序・PTS・TS連続性を検査し、stdin完了・PES対応・datagram結果が揃った先頭記録から順次確定します。後続frameが常時処理中でも全体の排出を待ちません。未確定記録は最大32件・2秒、stage標本は最大200件。同期を失った場合はdiag_active=0として次のFFmpegプロセスまで対応付けを休止し、配信は継続します。映像保存・再復号・本番UIへの識別子描画は行いません。
 
-During UI streaming, a small TS/PES observer measures capture → first PES observation → sending the datagram containing its first TS packet. It checks input order, PTS, and TS continuity, and confirms intervals only when input and PES counts balance. Unconfirmed records are limited to 32 and two seconds, with at most 200 samples per stage. Loss of synchronization sets diag_active=0 and suspends pairing until the next FFmpeg process; streaming continues. No video is saved or decoded, and no markers are drawn on the production UI.
+During UI streaming, a small TS/PES observer measures capture → first PES observation → sending the datagram containing its first TS packet. After checking input order, PTS, and TS continuity, it confirms records from the front once stdin completion, PES pairing, and the datagram result are available. It does not wait for the pipeline to drain while later frames remain in flight. Unconfirmed records are limited to 32 and two seconds, with at most 200 samples per stage. Loss of synchronization sets diag_active=0 and suspends pairing until the next FFmpeg process; streaming continues. No video is saved or decoded, and no markers are drawn on the production UI.
+
+diag_pending_maxで区間内の未確定記録の最大数、observer_parse_calls／total_ms／avg_us／max_usでchunk単位のobserve処理時間を確認できます。一定の1 frameずれは本番の順序・PTS検査だけでは完全検出できず、diag_active=1は映像identityの証明ではありません。固定FFmpeg構成の順序は別のmarker復号benchmarkで検証します。
+
+diag_pending_max reports peak unconfirmed records within each window. observer_parse_calls/total_ms/avg_us/max_us measure observe processing per chunk. A constant one-frame shift cannot always be detected from production order and PTS checks; diag_active=1 does not prove frame identity. A separate marker-decoding benchmark validates ordering for the fixed FFmpeg configuration.
 
 別途、合成画像の識別子・復号PTSを使う厳密なベンチマークと本番observerを500／1000／1500／3000 kbit/sで照合します。GPU・encoder・受信設定や75ms／100msの期限は維持しています。先頭datagramのsendto完了は、frame全体の送信完了やPC表示完了ではありません。[検証結果・ベンチマーク・実機手順](docs/ui_udp_stream.md)を参照してください。
 

@@ -2,6 +2,7 @@
 
 import errno
 import os
+import queue
 from contextlib import contextmanager
 from dataclasses import replace
 import subprocess
@@ -62,7 +63,8 @@ class TestScreenStreamer(unittest.TestCase):
       ('subprocess.Popen', {'side_effect': process}), ('MpegTsMulticastSender', {'side_effect': sender}),
       ('os.set_blocking', {'side_effect': lambda fd, blocking: None if fd == 42 else set_blocking(fd, blocking)}),
       ('select.select', {'return_value': ([], [], [])}),
-      ('NETWORK_INTERVAL', {'new': 0.02}), ('RETRY_INTERVAL', {'new': 0.03}),
+      ('CONFIG_INTERVAL', {'new': 0.02}), ('NETWORK_INTERVAL_CONNECTED', {'new': 0.02}),
+      ('NETWORK_INTERVAL_DISCONNECTED', {'new': 0.02}), ('RETRY_INTERVAL', {'new': 0.03}),
     ]:
       patcher = patch(f'{stream.__name__}.{target}', **kwargs)
       patcher.start()
@@ -99,8 +101,8 @@ class TestScreenStreamer(unittest.TestCase):
     self.assertEqual(self.commands[-1][self.commands[-1].index('-b:v') + 1], '3000k')
     time.sleep(0.1)
     self.assertEqual(len(self.processes), 2)
-    self.assertIn('screen stream restart: config changed old=', self.log_messages())
-    self.assertEqual(self.streamer._restart_count, 1)
+    self.assertIn('screen stream state: config changed old=', self.log_messages())
+    self.assertEqual(self.streamer._restart_count, 0)
 
   def test_invalid_saved_settings_stop_until_corrected(self):
     self.enabled = True
@@ -132,6 +134,9 @@ class TestScreenStreamer(unittest.TestCase):
     self.network.return_value = None
     wait_until(lambda: not self.streamer.ready.is_set())
     first.terminate.assert_called_once()
+    self.senders[0].close.assert_called_once()
+    self.assertEqual(self.streamer._restart_count, 0)
+    self.assertIn('screen stream state: network unavailable', self.log_messages())
     self.network.return_value = ('wlan0', '192.168.2.8')
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
     self.assertEqual(self.senders[-1].arguments[1], '192.168.2.8')
@@ -145,8 +150,7 @@ class TestScreenStreamer(unittest.TestCase):
     self.network.reset_mock()
     time.sleep(0.15)
     self.network.assert_not_called()
-    self.assertIn('screen stream restart: network changed old=', self.log_messages())
-    self.assertIn('new=None', self.log_messages())
+    self.assertIn('screen stream state: network changed old=', self.log_messages())
     self.assertIn('reason=stream disabled', self.log_messages())
 
   def test_screen_off_stops_and_wake_restarts(self):
@@ -169,16 +173,131 @@ class TestScreenStreamer(unittest.TestCase):
     self.assertIn('screen stream restart: ffmpeg exited rc=1', self.log_messages())
     self.assertEqual(self.streamer._restart_count, 1)
 
-  def test_network_error_stops_encoder(self):
+  def test_network_query_errors_preserve_encoder_and_recover(self):
     self.enabled = True
     self.streamer.start()
     wait_until(self.streamer.ready.is_set)
-    self.network.side_effect = OSError("D-Bus切断")
-    wait_until(lambda: not self.streamer.ready.is_set())
-    self.processes[0].terminate.assert_called_once()
-    self.network.side_effect = None
+    first = self.processes[0]
+    for error in [TimeoutError('D-Bus待機期限'), OSError('D-Bus通信失敗'), EOFError('D-Bus接続終了')]:
+      with self.subTest(error=error):
+        self.network.side_effect = error
+        wait_until(lambda: self.streamer._network_query_failures >= 2)
+        self.assertTrue(self.streamer.ready.is_set())
+        self.assertEqual(self.processes, [first])
+        first.terminate.assert_not_called()
+        self.senders[0].close.assert_not_called()
+        self.assertEqual(self.streamer._restart_count, 0)
+        self.network.side_effect = None
+        wait_until(lambda: self.streamer._network_query_failures == 0)
+    self.assertIn('screen stream network query transient:', self.log_messages())
+    self.assertIn("using=('wlan0', '192.168.1.8')", self.log_messages())
+    self.assertIn('screen stream network query recovered:', self.log_messages())
+    self.assertNotIn('screen stream restart:', self.log_messages())
+
+  def test_repeated_network_timeouts_do_not_restart_or_spam(self):
+    self.enabled = True
+    with patch.object(stream, 'NETWORK_INTERVAL_CONNECTED', 0.0), \
+         patch.object(self.streamer._frames, 'get', side_effect=queue.Empty):
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      self.network.side_effect = TimeoutError('D-Bus待機期限')
+      wait_until(lambda: self.streamer._network_query_failures >= 100)
+      self.assertEqual(len(self.processes), 1)
+      self.assertEqual(self.streamer._restart_count, 0)
+      self.assertTrue(self.streamer.ready.is_set())
+      self.assertEqual(self.cloudlog.warning.call_count, 1)
+      self.network.side_effect = None
+      wait_until(lambda: self.streamer._network_query_failures == 0)
+      self.streamer.close()
+
+  def test_network_error_warning_uses_ten_second_window(self):
+    error = TimeoutError('D-Bus待機期限')
+    with patch.object(stream.time, 'monotonic', return_value=1.0):
+      for _ in range(100):
+        self.streamer._log_network_query_error(('wlan0', '192.168.1.8'), error)
+    self.assertEqual(self.cloudlog.warning.call_count, 1)
+    with patch.object(stream.time, 'monotonic', return_value=10.9):
+      self.streamer._log_network_query_error(('wlan0', '192.168.1.8'), error)
+    self.assertEqual(self.cloudlog.warning.call_count, 1)
+    with patch.object(stream.time, 'monotonic', return_value=11.0):
+      self.streamer._log_network_query_error(('wlan0', '192.168.1.8'), error)
+    self.assertEqual(self.cloudlog.warning.call_count, 2)
+    self.assertIn('failures=102', self.cloudlog.warning.call_args.args[0])
+    self.cloudlog.exception.assert_not_called()
+
+  def test_startup_network_timeout_waits_without_restart_or_cleanup(self):
+    self.enabled = True
+    self.network.side_effect = TimeoutError('D-Bus待機期限')
+    with patch.object(self.streamer, '_close_process', wraps=self.streamer._close_process) as close:
+      self.streamer.start()
+      wait_until(lambda: self.streamer._network_query_failures >= 3)
+      self.assertEqual(self.processes, [])
+      self.assertEqual(self.streamer._restart_count, 0)
+      self.assertFalse(self.streamer.ready.is_set())
+      close.assert_not_called()
+      self.assertIn('screen stream network query failed before start:', self.log_messages())
+      self.network.side_effect = None
+      wait_until(self.streamer.ready.is_set)
+      self.assertEqual(len(self.processes), 1)
+      close.assert_not_called()
+      self.assertEqual(self.streamer._network_query_failures, 0)
+      self.assertNotIn('screen stream restart:', self.log_messages())
+
+  def test_query_timeouts_do_not_hide_config_changes(self):
+    self.enabled = True
+    self.config.return_value = ScreenStreamConfig(bitrate=500)
+    self.streamer.start()
+    wait_until(self.streamer.ready.is_set)
+    self.network.side_effect = TimeoutError('D-Bus待機期限')
+    wait_until(lambda: self.streamer._network_query_failures >= 1)
+    self.config.return_value = ScreenStreamConfig(bitrate=1500)
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
-    self.assertIn('screen stream restart: network query error:', self.log_messages())
+    self.assertEqual(self.senders[-1].arguments[1], '192.168.1.8')
+    self.assertEqual(self.senders[-1].arguments[2].bitrate, 1500)
+    self.processes[0].terminate.assert_called_once()
+    self.assertEqual(self.streamer._restart_count, 0)
+    self.assertIn('screen stream state: config changed', self.log_messages())
+    self.assertNotIn('screen stream restart:', self.log_messages())
+
+  def test_network_discovery_does_not_start_encoder_with_invalid_config(self):
+    self.enabled = True
+    self.config.side_effect = ValueError('設定破損')
+    # 障害後の100ms待機より長い猶予を設け、設定再試行の前にネットワーク照会を通す。
+    with patch.object(stream, 'RETRY_INTERVAL', 0.3):
+      self.streamer.start()
+      wait_until(lambda: self.network.called)
+      time.sleep(0.1)
+      self.assertEqual(self.processes, [])
+      self.assertFalse(self.streamer.ready.is_set())
+      self.config.side_effect = None
+      wait_until(self.streamer.ready.is_set)
+      self.assertEqual(len(self.processes), 1)
+
+  def test_connected_disconnected_and_config_polling_are_independent(self):
+    checks = []
+
+    def network():
+      checks.append(time.monotonic())
+      return self.network.return_value
+
+    self.network.return_value = None
+    self.network.side_effect = network
+    self.enabled = True
+    with patch.object(stream, 'NETWORK_INTERVAL_CONNECTED', 0.4), \
+         patch.object(stream, 'NETWORK_INTERVAL_DISCONNECTED', 0.02):
+      self.streamer.start()
+      wait_until(lambda: len(checks) >= 2)
+      self.assertGreaterEqual(checks[1] - checks[0], 0.02)
+      self.assertLess(checks[1] - checks[0], 0.4)
+      self.network.return_value = ('wlan0', '192.168.1.8')
+      wait_until(self.streamer.ready.is_set)
+      count, config_count = len(checks), self.config.call_count
+      time.sleep(0.15)
+      self.assertEqual(len(checks), count)
+      self.assertGreaterEqual(self.config.call_count - config_count, 2)
+      wait_until(lambda: len(checks) > count)
+      self.assertGreaterEqual(checks[count] - checks[count - 1], 0.4)
+      self.streamer.close()
 
   def test_each_transport_setting_and_interface_change_restarts(self):
     self.enabled = True
@@ -408,7 +527,7 @@ class TestScreenStreamer(unittest.TestCase):
 
 
 class TestWifiAddress(unittest.TestCase):
-  def query(self, device_type=2, state=100, mode=2, address='192.168.1.8', access_point='/ap'):
+  def query(self, device_type=2, state=100, mode=2, address='192.168.1.8', access_point='/ap', request_elapsed=0.0):
     from jeepney.low_level import MessageType
     responses = [
       ['/device'],
@@ -417,15 +536,31 @@ class TestWifiAddress(unittest.TestCase):
       ('aa{sv}', [{'address': ('s', address)}]),
     ]
     connection = Mock()
-    connection.send_and_get_reply.side_effect = [
+    replies = iter([
       SimpleNamespace(body=[body], header=SimpleNamespace(message_type=MessageType.method_return)) for body in responses
-    ]
-    with patch('jeepney.io.blocking.open_dbus_connection') as connect:
+    ])
+    self.request_timeouts = []
+    clock = 10.0
+
+    def reply(message, timeout):
+      nonlocal clock
+      self.request_timeouts.append(timeout)
+      clock += request_elapsed
+      return next(replies)
+
+    connection.send_and_get_reply.side_effect = reply
+    with patch('jeepney.io.blocking.open_dbus_connection') as connect, patch.object(stream.time, 'monotonic', side_effect=lambda: clock):
       connect.return_value.__enter__.return_value = connection
-      return stream.wifi_address()
+      result = stream.wifi_address()
+      connect.assert_called_once_with(bus="SYSTEM", auth_timeout=stream.NETWORK_REQUEST_TIMEOUT)
+      return result
 
   def test_connected_wifi_address(self):
     self.assertEqual(self.query(), ('wlan0', '192.168.1.8'))
+
+  def test_each_request_gets_fresh_timeout_budget(self):
+    self.assertEqual(self.query(request_elapsed=0.1), ('wlan0', '192.168.1.8'))
+    self.assertEqual(self.request_timeouts, [stream.NETWORK_REQUEST_TIMEOUT] * 4)
 
   def test_excludes_ethernet_cellular_disconnected_and_hotspot(self):
     for kwargs in [{'device_type': 1}, {'device_type': 8}, {'state': 30}, {'mode': 3}, {'access_point': '/'}]:

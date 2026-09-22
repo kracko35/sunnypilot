@@ -19,9 +19,13 @@ FRAME_BYTES = WIDTH * HEIGHT * 4
 DEFAULT_CONFIG = ScreenStreamConfig()
 MULTICAST_ADDRESS = DEFAULT_CONFIG.address
 PORT = DEFAULT_CONFIG.port
-NETWORK_INTERVAL = 1.0
+CONFIG_INTERVAL = 1.0
+NETWORK_INTERVAL_CONNECTED = 5.0
+NETWORK_INTERVAL_DISCONNECTED = 1.0
+NETWORK_ERROR_LOG_INTERVAL = 10.0
 RETRY_INTERVAL = 3.0
-NETWORK_TIMEOUT = 0.25
+# 各D-Bus往復に250msを与え、複数の照会で期限を共有しない。個々の待機は短く制限する。
+NETWORK_REQUEST_TIMEOUT = 0.25
 FRAME_MAX_AGE = 0.25
 PIPE_WRITE_TIMEOUT = 0.50
 TS_PACKET_SIZE = 188
@@ -59,13 +63,9 @@ def wifi_address() -> tuple[str, str] | None:
     NM, NM_PATH, NM_IFACE, NM_DEVICE_IFACE, NM_WIRELESS_IFACE, NM_IP4_CONFIG_IFACE, NM_DEVICE_TYPE_WIFI, NMDeviceState,
   )
 
-  deadline = time.monotonic() + NETWORK_TIMEOUT
-  with open_dbus_connection(bus="SYSTEM", auth_timeout=NETWORK_TIMEOUT) as connection:
+  with open_dbus_connection(bus="SYSTEM", auth_timeout=NETWORK_REQUEST_TIMEOUT) as connection:
     def request(message):
-      remaining = deadline - time.monotonic()
-      if remaining <= 0:
-        raise TimeoutError("Wi-Fi情報の取得がタイムアウトしました")
-      reply = connection.send_and_get_reply(message, timeout=remaining)
+      reply = connection.send_and_get_reply(message, timeout=NETWORK_REQUEST_TIMEOUT)
       if reply.header.message_type == MessageType.error:
         raise OSError("NetworkManagerからWi-Fi情報を取得できません")
       return reply.body[0]
@@ -202,6 +202,8 @@ class ScreenStreamer:
     self._proc: subprocess.Popen | None = None
     self._sender: MpegTsMulticastSender | None = None
     self._restart_count = 0
+    self._network_query_failures = 0
+    self._last_network_error_log: float | None = None
 
   def start(self):
     self._thread.start()
@@ -273,6 +275,14 @@ class ScreenStreamer:
     else:
       cloudlog.warning(message)
 
+  def _log_network_query_error(self, network: tuple[str, str] | None, error: Exception):
+    self._network_query_failures += 1
+    now = time.monotonic()
+    if self._last_network_error_log is None or now - self._last_network_error_log >= NETWORK_ERROR_LOG_INTERVAL:
+      state = "transient" if network is not None else "failed before start"
+      cloudlog.warning(f"screen stream network query {state}: failures={self._network_query_failures} using={network!r} error={error!r}")
+      self._last_network_error_log = now
+
   def _write_frame(self, captured: float, data: bytes):
     assert self._proc is not None and self._proc.stdin is not None
     remaining = memoryview(data)
@@ -305,7 +315,8 @@ class ScreenStreamer:
     current_network = None
     network_checked = False
     current_config = ScreenStreamConfig()
-    next_check = next_retry = 0.0
+    config_valid = False
+    next_config_check = next_network_check = next_retry = 0.0
     try:
       if hasattr(os, 'sched_setscheduler'):
         # UIのリアルタイム優先度をエンコーダと送信スレッドへ継承させない。
@@ -319,38 +330,54 @@ class ScreenStreamer:
             self._close_process("screen invisible" if enabled else "stream disabled")
             current_network = None
             network_checked = False
-            next_check = 0.0
+            config_valid = False
+            self._network_query_failures = 0
+            self._last_network_error_log = None
+            next_config_check = next_network_check = 0.0
             self._stop.wait(0.1)
             continue
-          if now >= next_check:
+          if now >= next_config_check:
             try:
               config = self._config()
             except Exception as error:
+              config_valid = False
               raise ScreenStreamError(f"invalid config: {error!r}") from error
+            config_valid = True
+            next_config_check = time.monotonic() + CONFIG_INTERVAL
+            if config != current_config:
+              reason = f"config changed old={current_config!r} new={config!r}"
+              cloudlog.info(f"screen stream state: {reason}")
+              if self._proc is not None:
+                self._close_process(reason)
+              current_config = config
+              next_retry = 0.0
+
+          if time.monotonic() >= next_network_check:
             try:
               network = self._network()
             except Exception as error:
-              raise ScreenStreamError(f"network query error: {error!r}") from error
-            if not network_checked and network is None:
-              cloudlog.info("screen stream state: network unavailable")
-            network_checked = True
-            next_check = time.monotonic() + NETWORK_INTERVAL
-            if network != current_network or config != current_config:
-              changes = []
-              if network != current_network:
-                changes.append(f"network changed old={current_network!r} new={network!r}")
-              if config != current_config:
-                changes.append(f"config changed old={current_config!r} new={config!r}")
-              reason = "; ".join(changes)
-              if self._proc is not None:
-                self._log_restart(reason)
-              else:
+              # 照会失敗は切断を意味しない。最後に確認できたWi-Fiと稼働中の送信処理を維持する。
+              self._log_network_query_error(current_network, error)
+            else:
+              if self._network_query_failures:
+                cloudlog.info(f"screen stream network query recovered: failures={self._network_query_failures}")
+                self._network_query_failures = 0
+                self._last_network_error_log = None
+              if network != current_network or not network_checked:
+                reason = (f"network changed old={current_network!r} new={network!r}" if network is not None
+                          else f"network unavailable old={current_network!r}")
                 cloudlog.info(f"screen stream state: {reason}")
-              self._close_process(reason)
-              current_network = network
-              current_config = config
-              next_retry = 0.0
-          if current_network is None:
+                if self._proc is not None:
+                  self._close_process(reason)
+                current_network = network
+                next_retry = 0.0
+              network_checked = True
+            interval = NETWORK_INTERVAL_CONNECTED if current_network is not None else NETWORK_INTERVAL_DISCONNECTED
+            next_network_check = time.monotonic() + interval
+
+          if self._stop.is_set() or not self.visible.is_set() or not self._enabled():
+            continue
+          if current_network is None or not config_valid:
             self._stop.wait(0.1)
             continue
           returncode = self._proc.poll() if self._proc is not None else None
@@ -383,12 +410,12 @@ class ScreenStreamer:
             self._write_frame(captured, data)
         except StreamStopped as error:
           self._close_process(str(error))
-          next_check = 0.0
+          next_config_check = next_network_check = 0.0
         except Exception as error:
           reason = str(error) if isinstance(error, ScreenStreamError) else f"unexpected error: {error!r}"
           self._log_restart(reason, exception=True)
           self._close_process(reason)
-          next_check = next_retry = time.monotonic() + RETRY_INTERVAL
+          next_config_check = next_retry = time.monotonic() + RETRY_INTERVAL
           self._stop.wait(0.1)
     except Exception:
       cloudlog.exception("screen stream worker failed")

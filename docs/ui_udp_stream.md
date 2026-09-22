@@ -77,7 +77,7 @@ Wi-Fiの判定は、NetworkManagerの接続済みWi-Fiデバイス、インフ�
 
 UIスレッドはFFmpegへ直接書かない。ワーカーが非ブロッキングパイプを使い、`FRAME_MAX_AGE=0.25`秒を超えた未送信フレームは単に破棄し、再起動しない。実際の書き込み開始時刻から`PIPE_WRITE_TIMEOUT=0.50`秒を設け、その期限を超過した場合に再起動する。待ち行列での待機時間をパイプの書き込み猶予から差し引かない。書きかけのrawvideoを途中で捨てて次フレームへ継ぎ足すことはしない。ワーカーのスケジューラとniceを変更した後にFFmpegと送信スレッドを生成し、UIのリアルタイム優先度を継承させない。エンコーダのスレッド数も2に制限する。
 
-Wi-Fiを通常1秒周期で確認する。OFF・消灯は通常100ms以内に確認し、処理中の照会・書き込み・子プロセス終了処理分の遅延が加わる。障害後は約3秒待って再試行する。これらは処理の期限であり、端末間の映像遅延を保証する値ではない。
+設定確認は`CONFIG_INTERVAL=1.0`秒、Wi-Fi確認は接続中`NETWORK_INTERVAL_CONNECTED=5.0`秒・未接続時`NETWORK_INTERVAL_DISCONNECTED=1.0`秒に分離する。次の照会は前回の完了時刻から間隔を空ける。OFF・消灯は通常100ms以内に確認し、処理中の照会・書き込み・子プロセス終了処理分の遅延が加わる。エンコーダや送信側の障害後は約3秒待って再試行する。Wi-Fi照会の一時失敗にはこの3秒待機を適用しない。これらは処理の期限であり、端末間の映像遅延を保証する値ではない。
 
 OFF時はWi-Fi照会・FFmpeg・socketを動作させず、配信専用のGPUリソースを解放する。表示用・録画用に必要なRenderTextureは維持する。
 
@@ -144,7 +144,13 @@ OFFへ戻すには`True`を`False`へ変更する。ブランチのロールバ�
 
 ## 実機での再起動診断
 
-利用者からは、comma 3XからPCへH.264 Constrained Baseline / yuv420p / 800×480 / 20fpsの映像が届く一方で、受信側のTS破損・DTS順序エラーとFFmpeg PIDの周期的変化が報告されている。Wi-Fi tupleと設定は30回の照会で安定し、単独stdinベンチマークでは50フレーム中の最大書き込み時間が114.2msだった。productionのスケジューラ・負荷条件は同一ではないため、再起動の根本原因は未確定。以下の理由別ログで判別する。
+利用者からは、comma 3XからPCへH.264 Constrained Baseline / yuv420p / 800×480 / 20fpsの映像が届く一方で、受信側のTS破損・DTS順序エラーとFFmpeg PIDの周期的変化が報告されている。Wi-Fi tupleと設定は30回の照会で安定し、単独stdinベンチマークでは50フレーム中の最大書き込み時間が114.2msだった。実機cloudlogで、大半の再起動理由が`network query error: TimeoutError(...)`と判明した。複数のD-Bus往復で250msの共通期限を消費し、一時的な照会失敗でも正常な配信を停止していたことが主因である。UDP破棄ログは報告されておらず、実際のビットレート変更による再生成は正常な動作として区別する。
+
+`wifi_address()`はGetDevices・Device.GetAll・Wireless.GetAll・AddressDataの各往復へ`NETWORK_REQUEST_TIMEOUT=0.25`秒を独立に与える。認証の期限も250ms。1回の問い合わせ全体を250msへ押し込まず、個々の待機は制限する。
+
+問い合わせが例外で失敗した場合は、最後に正常取得したWi-Fi tupleを変更せず、FFmpeg・sender・readyを維持する。起動前でtupleがない場合はエンコーダを起動せず、約1秒後の照会を待つ。どちらも`_restart_count`を増やさず、無意味なプロセス終了処理を行わない。設定取得は独立に行うため、ネットワーク照会失敗中もビットレートなどの変更を反映できる。
+
+正常に`None`が返った場合は、確認済みの未接続としてエンコーダを停止し、次の接続を待つ。正常に異なるtupleが返った場合は、送信インターフェースを更新するためエンコーダとsenderを再生成する。設定変更・tuple変更は通常の状態変更であり、障害再起動の回数には含めない。
 
 ログは`openpilot.common.swaglog.cloudlog`を使用し、通常のopenpilot環境ではlogmessaged経由で保存する。journalctlだけでは見えない場合がある。
 
@@ -153,7 +159,8 @@ OFFへ戻すには`True`を`False`へ変更する。ブランチのロールバ�
 pgrep -a -x ffmpeg
 watch -n 0.2 'pgrep -a -x ffmpeg'
 
-# 再起動理由、起動時のPIDと設定、UDP破棄の集計
+# ネットワーク照会の失敗と復旧、実際の障害再起動、起動情報、UDP破棄の集計
+grep -R -a "screen stream network query" /data/log 2>/dev/null | tail -50
 grep -R -a "screen stream restart" /data/log 2>/dev/null | tail -50
 grep -R -a "screen stream started" /data/log 2>/dev/null | tail -20
 grep -R -a "screen stream UDP drops" /data/log 2>/dev/null | tail -20
@@ -168,18 +175,23 @@ grep -R -a "screen stream UDP drops" /data/log 2>/dev/null | tail -20
 | `screen stream restart: frame write timeout` | フレームage、書き込み開始からの経過時間、残りbytes |
 | `screen stream restart: sender fatal error` | 元のerrnoと例外のrepr。生成時の失敗も区別 |
 | `screen stream restart: sender EOF` | stdoutの終了 |
-| `screen stream restart: invalid config` / `network query error` | 設定読み取り・Wi-Fi照会の失敗 |
+| `screen stream restart: invalid config` | 設定読み取りの失敗 |
 | `screen stream restart: encoder start failed` | FFmpeg欠落などの起動失敗 |
-| `screen stream restart: network changed` / `config changed` | 変更前後の値。両方変更された場合は同じ行に記録 |
+| `screen stream state: network changed` / `config changed` | 正常な再生成の理由と変更前後の値 |
+| `screen stream network query transient:` | 連続照会失敗数、維持するWi-Fi tuple、例外のrepr。最初の1回と以後10秒間隔 |
+| `screen stream network query failed before start:` | 起動前の照会失敗。約1秒周期で再照会し、警告は最初の1回と以後10秒間隔 |
+| `screen stream network query recovered:` | 照会成功時に1回記録し、連続失敗数をリセット |
 | `screen stream state:` | 起動・復帰時の状態変更、Wi-Fi未接続 |
 | `screen stream UDP drops:` | 累積破棄数、成功数、最後のerrno。初回と以後5秒間隔 |
 | `screen stream sender stopped:` | 送信成功数、破棄数、送信bytesの最終集計 |
 
-再起動ログの`count=`はワーカー内の再起動回数で、UIプロセスを起動し直すとリセットする。手動OFF・消灯による停止は障害回数に含めない。安定した1秒周期の照会ではログを増やさない。想定外の例外は`screen stream restart: unexpected error`、ワーカー自体の終了は`screen stream worker failed`で記録する。
+再起動ログの`count=`はワーカー内の障害再起動回数で、UIプロセスを起動し直すとリセットする。手動OFF・消灯・確認済みの未接続による停止、設定やWi-Fi tupleの変更、一時的なWi-Fi照会失敗は含めない。安定した周期照会ではログを増やさず、一時照会失敗のたびにstack traceは出さない。想定外の例外は`screen stream restart: unexpected error`、ワーカー自体の終了は`screen stream worker failed`で記録する。
 
-古いフレームの破棄や一時的なUDP送信失敗ではFFmpegを再起動しない。ネットワーク・設定変更では送信側とエンコーダを再生成する。OFF・消灯では停止し、ON・点灯で再開する。
+古いフレームの破棄、一時的なUDP送信失敗、D-Bus照会の一時失敗ではFFmpegを再起動しない。ネットワーク・設定変更では送信側とエンコーダを再生成する。OFF・消灯では停止し、ON・点灯で再開する。
 
 パケット破棄は映像欠損として見える可能性がある。GOP 10 / 20fpsならIDRの間隔は約0.5秒だが、継続的な通信損失や受信側の状態によって復旧は遅れる。再起動抑制が実機で改善したかは、PID・理由ログ・破棄数と受信映像を合わせて確認する。
+
+照会失敗が長時間続く場合も最後に確認できたWi-Fi情報を保持するため、実際の切断やIP変更の検出が遅れる可能性がある。正常応答が戻れば結果を反映し、socket側の致命的障害は従来どおり別経路で検出する。接続中の変更検出は最大約5秒に照会所要時間が加わる。D-Bus照会はUIではなく配信ワーカーで行うため、その実行中は新しいRGBAフレームの書き込みが一時停止し得る。期限は1リクエストごとで、照会全体の固定上限ではない。
 
 ## 受信と切り分け
 
@@ -213,7 +225,8 @@ GPU統合テストはOpenGLコンテキストとFFmpeg、ループバック上�
 
 2026-09-22の開発PCでの結果:
 
-- Python 3.12、Windows、Raylib 6.1-dev、FFmpeg 7.1で単体テスト54件とGPU統合テスト2件が成功。
+- Python 3.12、Windows、Raylib 6.1-dev、FFmpeg 7.1で単体テスト61件とGPU統合テスト2件が成功。
+- D-Bus照会失敗時の既存プロセス維持、100回連続失敗での警告集約、起動前の待機、正常な未接続・tuple変更、設定確認の独立性、不正設定のままWi-Fi検出に成功しても起動しないこと、各D-Busリクエストの独立した期限を検証。
 - 不規則なstdout読み取り境界からの1316 bytes集約、正常EOFの端数送信、不完全なTS端数破棄、socket設定、致命的障害の通知、送信スレッド終了を確認。
 - EAGAIN・ENOBUFS・EINTRなどの注入で送信継続とFFmpegの維持、破棄数・成功数・送信bytesを確認。100回の破棄で警告が100回出ないことを検証。
 - フレーム鮮度と書き込み期限の分離、古いフレームだけの破棄、実際のパイプ停止による再起動、原因別cloudlogメッセージと再起動回数を検証。
@@ -224,7 +237,7 @@ GPU統合テストはOpenGLコンテキストとFFmpeg、ループバック上�
 - 設定の境界値・不正値・URL文字列拒否・保存とキャンセル・録画中の編集無効化・OFF時の非表示・送信先変更時の再起動を確認。
 - 本家のPOローダーで12言語の翻訳収録を確認し、英語から日本語への切替と表示更新を検証。
 
-実機からはParamsの保存値とWi-Fi検出（wlan0）が正常で、標準FFmpegのUDP非対応によりエンコーダが即終了することが報告されている。その後、Python socket経由のPC受信成功と周期的なFFmpeg再起動が報告されている。本修正後の実機での再起動抑制と破棄率は未確認。開発PCの結果はcomma 3Xでの実測・本体ビルド・本家CI全体の成功を意味しない。Windowsには本家のLinuxネイティブ依存が揃わないため、本体UI全体の起動テストは未実施。Windowsテストではswaglogのネイティブ依存をモックへ差し替え、cloudlogへ渡すメッセージを検証する。実際のlogmessaged経由でのディスク保存は実機確認が必要。
+実機からはParamsの保存値とWi-Fi検出（wlan0）が正常で、標準FFmpegのUDP非対応によりエンコーダが即終了することが報告されている。その後、Python socket経由のPC受信成功と周期的なFFmpeg再起動が報告されている。本修正後の実機での再起動抑制と破棄率は未確認。開発PCの結果はcomma 3Xでの実測・本体ビルド・本家CI全体の成功を意味しない。Windowsには本家のLinuxネイティブ依存が揃わないため、本体UI全体の起動テストは未実施。Windowsテストではswaglogのネイティブ依存をモックへ差し替え、cloudlogへ渡すメッセージを検証する。実機で既存cloudlogが保存されることは報告済み。本修正後の照会ログとPID維持は引き続き実機確認が必要。
 
 ## 実機テスト記録
 

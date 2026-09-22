@@ -64,6 +64,10 @@ The standard FFmpeg build reported on comma 3X supports only `file` and `pipe`, 
 
 Queued frames older than 250ms are discarded. Pipe writes have a separate 500ms deadline measured from the start of writing. Restart reasons, PIDs and UDP drop counts are recorded through the standard cloudlog logger. See the [device diagnostics](docs/ui_udp_stream.md#実機での再起動診断).
 
+実機ログでは、複数のNetworkManager D-Bus照会が共有していた250msの期限超過を、配信障害として扱うことが周期的再起動の主因でした。各照会に独立した250msの期限を与え、照会失敗時は最後に確認できたWi-Fi情報で配信を続けます。正常な照会結果が未接続（`None`）なら停止し、接続先が変われば送信処理を再生成します。ネットワーク確認は接続中5秒・未接続時1秒、設定確認は独立した1秒周期です。
+
+Device logs identified a shared 250ms deadline across multiple NetworkManager D-Bus requests, with query timeouts treated as streaming failures, as the main cause of periodic restarts. Each request now receives its own 250ms timeout. Failed queries preserve the last known Wi-Fi connection and keep streaming; successful queries returning no connection (`None`) stop streaming, and connection changes rebuild the transport. Network checks run every 5 seconds while connected and every second while disconnected. Settings are checked independently every second.
+
 ## 配信仕様 / Stream settings
 
 | 項目 / Item | 値 / Value |

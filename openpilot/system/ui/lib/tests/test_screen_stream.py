@@ -1,6 +1,8 @@
 """配信の排他・復旧・遅延制限を実機なしで検証する。"""
 
+import errno
 import os
+from contextlib import contextmanager
 from dataclasses import replace
 import subprocess
 import time
@@ -8,8 +10,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from openpilot.system.ui.lib import screen_stream as stream
+from openpilot.system.ui.lib.tests.screen_stream_test_support import load_screen_stream
 from openpilot.system.ui.lib.screen_stream_config import PARAM_KEYS, ScreenStreamConfig, parse_stream_setting
+
+stream = load_screen_stream()
 
 
 def wait_until(predicate, timeout=2.0):
@@ -32,6 +36,9 @@ class TestScreenStreamer(unittest.TestCase):
     self.senders = []
     self.sender_class = stream.MpegTsMulticastSender
     self.stdout_factory = Mock
+    log_patch = patch.object(stream, 'cloudlog')
+    self.cloudlog = log_patch.start()
+    self.addCleanup(log_patch.stop)
     set_blocking = os.set_blocking
 
     def sender(*args):
@@ -67,6 +74,9 @@ class TestScreenStreamer(unittest.TestCase):
         self.addCleanup(patcher.stop)
     self.addCleanup(self.streamer.close)
 
+  def log_messages(self):
+    return '\n'.join(str(call.args[0]) for call in self.cloudlog.mock_calls if call.args)
+
   def test_disabled_has_no_network_or_encoder(self):
     self.streamer.start()
     time.sleep(0.15)
@@ -89,6 +99,8 @@ class TestScreenStreamer(unittest.TestCase):
     self.assertEqual(self.commands[-1][self.commands[-1].index('-b:v') + 1], '3000k')
     time.sleep(0.1)
     self.assertEqual(len(self.processes), 2)
+    self.assertIn('screen stream restart: config changed old=', self.log_messages())
+    self.assertEqual(self.streamer._restart_count, 1)
 
   def test_invalid_saved_settings_stop_until_corrected(self):
     self.enabled = True
@@ -99,6 +111,7 @@ class TestScreenStreamer(unittest.TestCase):
     self.processes[0].terminate.assert_called_once()
     self.config.side_effect = None
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+    self.assertIn('screen stream restart: invalid config:', self.log_messages())
 
   def test_settings_saved_while_disabled_apply_on_enable(self):
     self.config.return_value = ScreenStreamConfig(port=23456)
@@ -132,6 +145,9 @@ class TestScreenStreamer(unittest.TestCase):
     self.network.reset_mock()
     time.sleep(0.15)
     self.network.assert_not_called()
+    self.assertIn('screen stream restart: network changed old=', self.log_messages())
+    self.assertIn('new=None', self.log_messages())
+    self.assertIn('reason=stream disabled', self.log_messages())
 
   def test_screen_off_stops_and_wake_restarts(self):
     self.enabled = True
@@ -142,6 +158,7 @@ class TestScreenStreamer(unittest.TestCase):
     self.streamer.visible.set()
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
     self.senders[0].close.assert_called_once()
+    self.assertIn('reason=screen invisible', self.log_messages())
 
   def test_encoder_exit_restarts(self):
     self.enabled = True
@@ -149,6 +166,8 @@ class TestScreenStreamer(unittest.TestCase):
     wait_until(self.streamer.ready.is_set)
     self.processes[-1].poll.return_value = 1
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+    self.assertIn('screen stream restart: ffmpeg exited rc=1', self.log_messages())
+    self.assertEqual(self.streamer._restart_count, 1)
 
   def test_network_error_stops_encoder(self):
     self.enabled = True
@@ -159,6 +178,7 @@ class TestScreenStreamer(unittest.TestCase):
     self.processes[0].terminate.assert_called_once()
     self.network.side_effect = None
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+    self.assertIn('screen stream restart: network query error:', self.log_messages())
 
   def test_each_transport_setting_and_interface_change_restarts(self):
     self.enabled = True
@@ -175,7 +195,8 @@ class TestScreenStreamer(unittest.TestCase):
     wait_until(lambda: len(self.processes) == 6 and self.streamer.ready.is_set())
     self.senders[-2].close.assert_called_once()
 
-  def test_socket_failure_stops_encoder_and_restarts_transport(self):
+  @contextmanager
+  def real_transport(self):
     writers, transports, sockets = [], [], []
 
     def stdout():
@@ -193,27 +214,109 @@ class TestScreenStreamer(unittest.TestCase):
 
     def socket(*args):
       sock = Mock()
-      sock.sendto.side_effect = OSError('UDP送信障害')
+      sock.sendto.side_effect = lambda payload, destination: len(payload)
       sockets.append(sock)
       return sock
 
     self.stdout_factory = stdout
     self.enabled = True
     with patch.object(stream, 'MpegTsMulticastSender', side_effect=sender), patch.object(stream.socket, 'socket', side_effect=socket):
-      self.streamer.start()
       try:
-        wait_until(self.streamer.ready.is_set)
-        os.write(writers[0], b'\x47' * 188)
-        wait_until(lambda: len(transports) == 2 and self.streamer.ready.is_set())
-        self.assertIsInstance(transports[0].error, OSError)
-        self.assertFalse(transports[0]._thread.is_alive())
-        self.processes[0].terminate.assert_called_once()
-        self.assertTrue(self.processes[0].stdout.closed)
-        sockets[0].close.assert_called()
+        self.streamer.start()
+        yield writers, transports, sockets
       finally:
         self.streamer.close()
-      self.assertTrue(all(not transport._thread.is_alive() for transport in transports))
-      self.assertTrue(all(proc.stdout.closed for proc in self.processes))
+
+  def test_socket_failure_stops_encoder_and_restarts_transport(self):
+    with self.real_transport() as (writers, transports, sockets):
+      wait_until(self.streamer.ready.is_set)
+      sockets[0].sendto.side_effect = OSError(errno.ENETDOWN, 'UDP送信障害')
+      os.write(writers[0], b'\x47' * stream.UDP_PAYLOAD_SIZE)
+      wait_until(lambda: len(transports) == 2 and self.streamer.ready.is_set())
+      self.assertIsInstance(transports[0].error, OSError)
+      self.assertFalse(transports[0]._thread.is_alive())
+      self.processes[0].terminate.assert_called_once()
+      self.assertTrue(self.processes[0].stdout.closed)
+      sockets[0].close.assert_called()
+      self.assertIn('screen stream restart: sender fatal error:', self.log_messages())
+      self.assertIn(f'errno={errno.ENETDOWN}', self.log_messages())
+      self.assertIn(repr(transports[0].error), self.log_messages())
+    self.assertTrue(all(not transport._thread.is_alive() for transport in transports))
+    self.assertTrue(all(proc.stdout.closed for proc in self.processes))
+
+  def test_transient_send_errors_keep_sender_and_encoder_alive(self):
+    errors = [BlockingIOError(errno.EAGAIN, '一時的な送信不可'), OSError(errno.EWOULDBLOCK, '送信待ち'),
+              OSError(errno.ENOBUFS, '送信バッファ不足'), InterruptedError(errno.EINTR, '割り込み'), TimeoutError('送信待ち期限')]
+    with self.real_transport() as (writers, transports, sockets):
+      wait_until(self.streamer.ready.is_set)
+      transport = transports[0]
+      for count, error in enumerate(errors, start=1):
+        with self.subTest(error=error):
+          sockets[0].sendto.side_effect = [error, 1316]
+          dropped = bytes([count]) * 1316
+          sent = bytes([count + 10]) * 1316
+          os.write(writers[0], dropped)
+          wait_until(lambda count=count: transport.datagrams_dropped == count)
+          self.assertFalse(transport.done.is_set())
+          self.assertIsNone(transport.error)
+          self.assertTrue(transport._thread.is_alive())
+          os.write(writers[0], sent)
+          wait_until(lambda count=count: transport.datagrams_sent == count)
+          self.assertEqual(sockets[0].sendto.call_args.args[0], sent)
+          self.assertEqual(transport.bytes_sent, count * 1316)
+      time.sleep(0.1)
+      self.assertEqual(len(self.processes), 1)
+      self.assertTrue(self.streamer.ready.is_set())
+      self.assertEqual(self.streamer._restart_count, 0)
+      self.assertEqual(self.cloudlog.warning.call_count, 1)
+      self.assertIn('screen stream started: pid=', self.log_messages())
+
+  def test_stable_network_and_config_do_not_spam_logs(self):
+    self.enabled = True
+    self.streamer.start()
+    wait_until(self.streamer.ready.is_set)
+    self.cloudlog.reset_mock()
+    time.sleep(0.2)
+    self.cloudlog.assert_not_called()
+    self.assertEqual(self.cloudlog.mock_calls, [])
+    self.assertEqual(self.streamer._restart_count, 0)
+
+  def test_stale_frame_is_dropped_without_encoder_restart(self):
+    self.enabled = True
+    with patch.object(stream.os, 'write', return_value=stream.FRAME_BYTES) as write:
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      self.streamer._frames.put_nowait((time.monotonic() - stream.FRAME_MAX_AGE - 1, bytes(stream.FRAME_BYTES)))
+      wait_until(self.streamer._frames.empty)
+      # 次の新鮮なフレームまで処理できれば、古いフレームによる書き込みも再起動もない。
+      self.streamer.submit(bytes(stream.FRAME_BYTES))
+      wait_until(lambda: write.call_count == 1)
+      self.assertEqual(len(self.processes), 1)
+      self.assertEqual(self.streamer._restart_count, 0)
+
+  def test_pipe_deadline_starts_at_write_not_capture(self):
+    self.streamer._proc = Mock()
+    with patch.object(stream.time, 'monotonic', side_effect=[10.0, 10.0, 10.4]), \
+         patch.object(stream.os, 'write', side_effect=[1, 2]) as write:
+      self.streamer._write_frame(9.8, b'abc')
+    self.assertEqual(write.call_count, 2)
+
+  def test_pipe_timeout_reports_age_elapsed_and_remaining_bytes(self):
+    self.streamer._proc = Mock()
+    with patch.object(stream.time, 'monotonic', side_effect=[10.0, 10.0, 10.51]), \
+         patch.object(stream.os, 'write', return_value=1):
+      with self.assertRaises(stream.FrameWriteTimeout) as caught:
+        self.streamer._write_frame(9.8, b'abc')
+    message = str(caught.exception)
+    self.assertIn('age=0.710s', message)
+    self.assertIn('write_elapsed=0.510s', message)
+    self.assertIn('remaining_bytes=2', message)
+
+  def test_screen_off_during_write_is_not_a_timeout(self):
+    self.streamer._proc = Mock()
+    self.streamer.visible.clear()
+    with self.assertRaisesRegex(stream.StreamStopped, 'screen invisible'):
+      self.streamer._write_frame(time.monotonic(), b'abc')
 
   def test_sender_eof_stops_encoder_and_retries(self):
     self.enabled = True
@@ -230,6 +333,7 @@ class TestScreenStreamer(unittest.TestCase):
       self.streamer.start()
       wait_until(lambda: launch.call_count >= 2)
       self.assertFalse(self.streamer.ready.is_set())
+      self.assertIn('screen stream restart: encoder start failed:', self.log_messages())
 
   def test_queue_keeps_only_latest_and_rejects_wrong_size(self):
     self.streamer.ready.set()
@@ -264,6 +368,10 @@ class TestScreenStreamer(unittest.TestCase):
       self.streamer.close()
       self.assertLess(time.monotonic() - start, 1)
       self.assertFalse(self.streamer._thread.is_alive())
+      message = self.log_messages()
+      self.assertIn('screen stream restart: frame write timeout age=', message)
+      self.assertIn('write_elapsed=', message)
+      self.assertIn('remaining_bytes=', message)
 
   def test_kill_if_encoder_ignores_terminate(self):
     proc = self.streamer._proc = Mock()
@@ -349,6 +457,11 @@ class TestCommand(unittest.TestCase):
 
 
 class TestMpegTsMulticastSender(unittest.TestCase):
+  def setUp(self):
+    log_patch = patch.object(stream, 'cloudlog')
+    self.cloudlog = log_patch.start()
+    self.addCleanup(log_patch.stop)
+
   def run_sender(self, chunks, config=stream.DEFAULT_CONFIG):
     sock = Mock()
     sock.sendto.side_effect = lambda payload, destination: len(payload)
@@ -366,16 +479,22 @@ class TestMpegTsMulticastSender(unittest.TestCase):
     sock.setsockopt.assert_any_call(stream.socket.IPPROTO_IP, stream.socket.IP_MULTICAST_IF, stream.socket.inet_aton('192.168.4.38'))
     sock.setsockopt.assert_any_call(stream.socket.IPPROTO_IP, stream.socket.IP_MULTICAST_TTL, config.ttl)
     sock.bind.assert_not_called()
+    sock.setblocking.assert_called_once_with(False)
+    sock.settimeout.assert_not_called()
     sock.close.assert_called()
     calls = sock.sendto.call_args_list
     self.assertTrue(all(call.args[1] == (config.address, config.port) for call in calls))
     packets = [call.args[0] for call in calls]
     self.assertTrue(all(0 < len(packet) <= 1316 and len(packet) % 188 == 0 for packet in packets))
+    self.assertTrue(all(len(packet) == 1316 for packet in packets[:-1]))
+    self.assertEqual(sender.datagrams_sent, len(packets))
+    self.assertEqual(sender.datagrams_dropped, 0)
+    self.assertEqual(sender.bytes_sent, sum(map(len, packets)))
     return b''.join(packets)
 
   def test_irregular_reads_preserve_all_ts_bytes(self):
     ts = b''.join(b'\x47' + bytes([i % 256]) * 187 for i in range(200))
-    chunks, offset, sizes = [], 0, [1, 500, 4096, 187, 1316, 2]
+    chunks, offset, sizes = [], 0, [1, 100, 187, 188, 500, 4096, 2]
     while offset < len(ts):
       size = sizes[len(chunks) % len(sizes)]
       chunks.append(ts[offset:offset + size])
@@ -408,12 +527,81 @@ class TestMpegTsMulticastSender(unittest.TestCase):
       self.assertRaises(OSError, stream.MpegTsMulticastSender, Mock(), '192.168.4.38', ScreenStreamConfig())
       create.return_value.close.assert_called_once()
 
-  def test_socket_timeout_and_read_error_are_reported(self):
+  def test_coalesces_until_full_and_does_not_flush_on_stop(self):
+    read_fd, write_fd = os.pipe()
+    self.addCleanup(os.close, write_fd)
+    with os.fdopen(read_fd, 'rb', buffering=0) as stdout, patch.object(stream.socket, 'socket') as create:
+      create.return_value.sendto.side_effect = lambda payload, destination: len(payload)
+      sender = stream.MpegTsMulticastSender(stdout, '127.0.0.1', ScreenStreamConfig())
+      sender.start()
+      try:
+        os.write(write_fd, b'A' * 188)
+        time.sleep(0.03)
+        create.return_value.sendto.assert_not_called()
+        os.write(write_fd, b'B' * (1316 - 188))
+        wait_until(lambda: sender.datagrams_sent == 1)
+        self.assertEqual(create.return_value.sendto.call_args.args[0], b'A' * 188 + b'B' * (1316 - 188))
+        os.write(write_fd, b'C' * 188)
+        time.sleep(0.03)
+      finally:
+        sender.close()
+      self.assertEqual(sender.datagrams_sent, 1)
+
+  def test_transient_drop_removes_exactly_one_datagram(self):
+    payloads = [bytes([i]) * 1316 for i in range(3)]
+    with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'), \
+         patch.object(stream.os, 'read', side_effect=[b''.join(payloads), b'']):
+      create.return_value.sendto.side_effect = [1316, OSError(errno.ENOBUFS, '送信バッファ不足'), 1316]
+      sender = stream.MpegTsMulticastSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      sender.start()
+      try:
+        self.assertTrue(sender.done.wait(2))
+      finally:
+        sender.close()
+      self.assertIsNone(sender.error)
+      self.assertEqual([call.args[0] for call in create.return_value.sendto.call_args_list], payloads)
+      self.assertEqual((sender.datagrams_sent, sender.datagrams_dropped, sender.bytes_sent), (2, 1, 2632))
+
+  def test_drop_warning_is_aggregated_and_rate_limited(self):
+    with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'):
+      create.return_value.sendto.side_effect = OSError(errno.ENOBUFS, '送信バッファ不足')
+      sender = stream.MpegTsMulticastSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      try:
+        with patch.object(stream.time, 'monotonic', return_value=1.0):
+          for _ in range(100):
+            self.assertFalse(sender._send_datagram(bytes(1316)))
+        self.assertEqual(sender.datagrams_dropped, 100)
+        self.assertEqual(self.cloudlog.warning.call_count, 1)
+        with patch.object(stream.time, 'monotonic', return_value=6.0):
+          sender._send_datagram(bytes(1316))
+        self.assertEqual(self.cloudlog.warning.call_count, 2)
+        self.assertIn('dropped=101 sent=0', self.cloudlog.warning.call_args.args[0])
+        self.assertIn(f'last_errno={errno.ENOBUFS}', self.cloudlog.warning.call_args.args[0])
+      finally:
+        sender.close()
+
+  def test_platform_transient_errnos_and_fatal_errors(self):
+    with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'):
+      sender = stream.MpegTsMulticastSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      try:
+        for code in stream.TRANSIENT_SEND_ERRNOS:
+          create.return_value.sendto.side_effect = OSError(code, '一時障害')
+          self.assertFalse(sender._send_datagram(bytes(1316)))
+        for code in [errno.ENETDOWN, errno.ENODEV, errno.EADDRNOTAVAIL]:
+          error = OSError(code, '致命的な障害')
+          create.return_value.sendto.side_effect = error
+          with self.assertRaises(OSError) as caught:
+            sender._send_datagram(bytes(1316))
+          self.assertIs(caught.exception, error)
+      finally:
+        sender.close()
+
+  def test_fatal_socket_and_read_error_are_reported(self):
     for read_error in [False, True]:
       with self.subTest(read_error=read_error), patch.object(stream.socket, 'socket') as create, \
            patch.object(stream.os, 'set_blocking'), patch.object(stream.os, 'read') as read:
-        read.side_effect = OSError('パイプ障害') if read_error else [b'\x47' * 188]
-        create.return_value.sendto.side_effect = TimeoutError('送信期限超過')
+        read.side_effect = OSError('パイプ障害') if read_error else [b'\x47' * 1316]
+        create.return_value.sendto.side_effect = OSError(errno.ENETDOWN, 'ネットワーク停止')
         sender = stream.MpegTsMulticastSender(Mock(), '192.168.4.38', ScreenStreamConfig())
         sender.start()
         try:

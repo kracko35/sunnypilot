@@ -10,8 +10,11 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from openpilot.system.ui.lib.screen_stream import WIDTH, HEIGHT, FRAME_BYTES, MpegTsMulticastSender, ffmpeg_command
+from openpilot.system.ui.lib.tests.screen_stream_test_support import load_screen_stream
 from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
+
+
+stream = load_screen_stream()
 
 
 @unittest.skipUnless(os.getenv('SCREEN_STREAM_TEST_GPU') == '1', 'GPU統合テストは明示的に有効化してください')
@@ -45,11 +48,11 @@ class TestScreenStreamVideo(unittest.TestCase):
     self.addCleanup(capture.release)
     capture.capture(source.texture)
     data = streamer.submit.call_args.args[0]
-    self.assertEqual(len(data), FRAME_BYTES)
+    self.assertEqual(len(data), stream.FRAME_BYTES)
 
     with tempfile.TemporaryDirectory() as directory:
       output = str(Path(directory) / 'screen.ts')
-      command = ffmpeg_command(config)
+      command = stream.ffmpeg_command(config)
       command[0] = ffmpeg
       # 開発PCにUDP対応FFmpegがあっても、エンコードにはfile/pipe以外を許可しない。
       command[1:1] = ['-protocol_whitelist', 'file,pipe']
@@ -64,14 +67,14 @@ class TestScreenStreamVideo(unittest.TestCase):
       decoded = subprocess.run([ffmpeg, '-i', output, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
                                capture_output=True, timeout=20)
       self.assertEqual(decoded.returncode, 0, decoded.stderr.decode(errors='replace'))
-      self.assertEqual(len(decoded.stdout), WIDTH * HEIGHT * 3)
+      self.assertEqual(len(decoded.stdout), stream.WIDTH * stream.HEIGHT * 3)
       self.assertIn(b'Constrained Baseline', decoded.stderr)
       self.assertIn(b'20 fps', decoded.stderr)
       self.assertIn(b'yuv420p', decoded.stderr)
       self.assertEqual(command[command.index('-bf') + 1], '0')
 
       def pixel(x, y):
-        offset = (y * WIDTH + x) * 3
+        offset = (y * stream.WIDTH + x) * 3
         return decoded.stdout[offset:offset + 3]
 
       self.assertLess(max(pixel(400, 10)), 10)
@@ -105,7 +108,7 @@ class TestScreenStreamVideo(unittest.TestCase):
         try:
           with tempfile.TemporaryFile() as stderr:
             proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, bufsize=0)
-            sender = MpegTsMulticastSender(proc.stdout, '127.0.0.1', config)
+            sender = stream.MpegTsMulticastSender(proc.stdout, '127.0.0.1', config)
             writer_errors = []
 
             def write_frames():
@@ -151,6 +154,10 @@ class TestScreenStreamVideo(unittest.TestCase):
         self.assertFalse(reader.is_alive())
       self.assertTrue(packets, 'UDPマルチキャストを受信できませんでした')
       self.assertTrue(all(len(packet) <= 1316 and len(packet) % 188 == 0 for packet in packets))
+      self.assertTrue(all(len(packet) == 1316 for packet in packets[:-1]))
+      self.assertEqual(sender.datagrams_dropped, 0)
+      self.assertEqual(sender.datagrams_sent, len(packets))
+      self.assertEqual(sender.bytes_sent, sum(map(len, packets)))
       self.assertTrue(all(packet[offset] == 0x47 for packet in packets for offset in range(0, len(packet), 188)))
       inspected = subprocess.run([ffmpeg, '-protocol_whitelist', 'file,pipe', '-f', 'mpegts', '-i', 'pipe:0',
                                   '-vf', 'showinfo', '-f', 'null', '-'], input=b''.join(packets), capture_output=True, timeout=20)
@@ -163,7 +170,7 @@ class TestScreenStreamVideo(unittest.TestCase):
       self.assertEqual(received.returncode, 0, received.stderr.decode(errors='replace'))
       self.assertEqual(len(received.stdout), len(decoded.stdout))
       for y in [10, 100, 350, 470]:
-        offset = (y * WIDTH + 400) * 3
+        offset = (y * stream.WIDTH + 400) * 3
         for actual, expected in zip(received.stdout[offset:offset + 3], pixel(400, y), strict=True):
           self.assertLessEqual(abs(actual - expected), 10)
 

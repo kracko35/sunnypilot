@@ -56,9 +56,13 @@ UI RGBA → FFmpeg stdin → libx264 / MPEG-TS → stdout (pipe:1)
                                   Python socket → UDP multicast
 ```
 
-comma 3Xで確認された標準FFmpegは`file`と`pipe`のみをサポートするため、FFmpegのUDPプロトコルには依存しません。必要なのは`libx264`、`mpegts`、`pipe`です。Python標準ライブラリだけでWi-FiインターフェースとTTLを設定し、専用スレッドで送信します。各UDPペイロードは188 bytesの整数倍・最大1316 bytesです。この上限はPython側で制御します。
+comma 3Xで確認された標準FFmpegは`file`と`pipe`のみをサポートするため、FFmpegのUDPプロトコルには依存しません。必要なのは`libx264`、`mpegts`、`pipe`です。Python標準ライブラリだけでWi-FiインターフェースとTTLを設定し、専用スレッドで送信します。Python側で通常のUDPペイロードを1316 bytesへ集約し、正常終了時の最後だけ188 bytesの整数倍で短く送信できます。一時的な送信バッファ不足ではそのデータグラムだけを破棄し、FFmpegは維持します。
 
-The standard FFmpeg build reported on comma 3X supports only `file` and `pipe`, so streaming does not depend on FFmpeg's UDP protocol. It requires `libx264`, `mpegts`, and `pipe`. A dedicated thread uses Python's standard library to set the Wi-Fi multicast interface and TTL and send the data. Python limits each UDP payload to a multiple of 188 bytes, up to 1316 bytes.
+The standard FFmpeg build reported on comma 3X supports only `file` and `pipe`, so streaming does not depend on FFmpeg's UDP protocol. It requires `libx264`, `mpegts`, and `pipe`. A dedicated thread uses Python's standard library to set the Wi-Fi multicast interface and TTL and send the data. Python coalesces normal UDP payloads to 1316 bytes; only the final payload at clean EOF may be shorter, in multiples of 188 bytes. Temporary send-buffer pressure drops the affected datagram while keeping FFmpeg running.
+
+フレーム取得から250msを超えた未送信フレームは破棄します。パイプの書き込み期限は書き込み開始から500msです。再起動理由・PID・UDP破棄数は標準のcloudlogへ記録します。[実機診断手順](docs/ui_udp_stream.md#実機での再起動診断)を参照してください。
+
+Queued frames older than 250ms are discarded. Pipe writes have a separate 500ms deadline measured from the start of writing. Restart reasons, PIDs and UDP drop counts are recorded through the standard cloudlog logger. See the [device diagnostics](docs/ui_udp_stream.md#実機での再起動診断).
 
 ## 配信仕様 / Stream settings
 
@@ -71,7 +75,7 @@ The standard FFmpeg build reported on comma 3X supports only `file` and `pipe`, 
 | ビットレート / Bitrate | 設定可能、既定1500 kbit/s。VBVは約1/3 / configurable, default 1500 kbit/s; VBV about one third |
 | GOP / Bフレーム / B-frames | 10 / 0 |
 | 形式 / Format | H.264 / MPEG-TS / UDP multicast |
-| TTL / UDP payload | TTL設定可能（既定1）/ 最大1316 bytes / configurable TTL (default 1), up to 1316 bytes |
+| TTL / UDP payload | TTL設定可能（既定1）/ 通常1316 bytes / configurable TTL (default 1), normally 1316 bytes |
 | フレーム待ち行列 / Pending frames | 最新1枚 / one latest frame |
 | 永続設定 / Persistent parameter | `ScreenStreamEnabled`、初期値OFF / default off |
 
@@ -85,9 +89,9 @@ The stream is unencrypted and unauthenticated. Enabling it exposes the UI, inclu
 
 ## 検証と開発 / Validation and development
 
-Windows開発PCで単体テストとGPU・FFmpeg標準出力・Python socket・ループバックUDPマルチキャストの統合テストを実行済みです。統合テストのエンコーダには`file,pipe`だけを許可しています。comma 3X上のビルド、負荷・温度・実遅延、実Wi-FiとMIB / MOST / AID表示は未検証です。
+Windows開発PCで単体テストとGPU・FFmpeg標準出力・Python socket・ループバックUDPマルチキャストの統合テストを実行済みです。統合テストのエンコーダには`file,pipe`だけを許可しています。comma 3XからPCへの受信成功と周期的なFFmpeg再起動が報告されています。本修正後の再起動抑制、実機の負荷・温度・遅延、MIB / MOST / AID表示は未検証です。
 
-Unit tests and GPU / FFmpeg stdout / Python socket / loopback UDP multicast integration tests have been run on a Windows development PC. The integration-test encoder permits only the `file,pipe` protocols. Device builds, comma 3X load, temperature, end-to-end latency, real Wi-Fi, and MIB / MOST / AID display remain unverified.
+Unit tests and GPU / FFmpeg stdout / Python socket / loopback UDP multicast integration tests have been run on a Windows development PC. The integration-test encoder permits only the `file,pipe` protocols. Successful reception from comma 3X and periodic FFmpeg restarts have been reported. Restart reduction after this update, device load, temperature, latency, and MIB / MOST / AID display remain unverified.
 
 [実装仕様・ビルド・実機テスト手順 / Implementation, build and device-test guide (Japanese)](docs/ui_udp_stream.md)
 

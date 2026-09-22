@@ -2,7 +2,7 @@
 
 ## 目的と対象
 
-comma 3Xのsunnypilot UIを同一Wi-Fiの受信端末へ配信する。送信側は汎用的な画面配信機能とし、MIB・MOST・AIDへの依存を持たせない。受信側の候補はFFplayとVcMOSTRenderMqbのstream-player。実機への導入やMIB側の操作は、この変更では実行していない。
+comma 3Xのsunnypilot UIを同一Wi-Fiの受信端末へ配信する。送信側は汎用的な画面配信機能とし、MIB・MOST・AIDへの依存を持たせない。受信側の候補はFFplayとVcMOSTRenderMqbのstream-player。実機からPCへの受信結果は利用者からの報告に基づく。本修正後の実機確認とMIB側の操作は、この開発環境では実行していない。
 
 ## ブランチ構成
 
@@ -75,7 +75,7 @@ OpenGLの上下方向は縮小描画時とFFmpegの`vflip`で揃える。FPS表�
 
 Wi-Fiの判定は、NetworkManagerの接続済みWi-Fiデバイス、インフラストラクチャモード、有効なIPv4の組み合わせで行う。デフォルトルートが携帯回線でもWi-Fiが接続済みなら配信できる。Pythonの`socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)`を使い、`IP_MULTICAST_IF`へWi-FiのIPv4を、`IP_MULTICAST_TTL`へ設定値を指定する。`bind`は使用しない。Wi-Fiインターフェース名・IPv4・宛先・ポート・ビットレート・TTLのいずれかが変われば、FFmpegとsocketを作り直す。
 
-UIスレッドはFFmpegへ直接書かない。ワーカーが非ブロッキングパイプを使い、取得から250ms以内にフレームを書き切れなければプロセスを再起動する。書きかけのrawvideoを途中で捨てて次フレームへ継ぎ足すことはしない。ワーカーのスケジューラとniceを変更した後にFFmpegと送信スレッドを生成し、UIのリアルタイム優先度を継承させない。エンコーダのスレッド数も2に制限する。
+UIスレッドはFFmpegへ直接書かない。ワーカーが非ブロッキングパイプを使い、`FRAME_MAX_AGE=0.25`秒を超えた未送信フレームは単に破棄し、再起動しない。実際の書き込み開始時刻から`PIPE_WRITE_TIMEOUT=0.50`秒を設け、その期限を超過した場合に再起動する。待ち行列での待機時間をパイプの書き込み猶予から差し引かない。書きかけのrawvideoを途中で捨てて次フレームへ継ぎ足すことはしない。ワーカーのスケジューラとniceを変更した後にFFmpegと送信スレッドを生成し、UIのリアルタイム優先度を継承させない。エンコーダのスレッド数も2に制限する。
 
 Wi-Fiを通常1秒周期で確認する。OFF・消灯は通常100ms以内に確認し、処理中の照会・書き込み・子プロセス終了処理分の遅延が加わる。障害後は約3秒待って再試行する。これらは処理の期限であり、端末間の映像遅延を保証する値ではない。
 
@@ -92,11 +92,11 @@ FFmpeg出力の変更後: pipe:1
 
 `ffmpeg_command(config)`は送信元アドレスを引数に取らず、宛先・ポート・TTLもコマンドへ渡さない。エンコード条件は維持する。標準入力・標準出力を`subprocess.PIPE`、`bufsize=0`で開き、stderrは従来どおり継承する。
 
-ワーカーはRGBAをstdinへ書き、別の送信スレッドがstdoutを常時読み出す。読み書きを同じスレッドで処理しないため、stdoutの満杯でエンコーダが停止し、stdin書き込みまで停止する循環待ちを防ぐ。stdoutは非ブロッキング読み取り、socketは100msの送信タイムアウトを使用する。
+ワーカーはRGBAをstdinへ書き、別の送信スレッドがstdoutを常時読み出す。読み書きを同じスレッドで処理しないため、stdoutの満杯でエンコーダが停止し、stdin書き込みまで停止する循環待ちを防ぐ。stdoutとsocketは非ブロッキングで処理する。送信バッファの空きを待たず、一時障害のデータグラムは再送しない。
 
-読み取り境界とTSパケット境界は一致しない。読み取ったデータを一時バッファへ追記し、188 bytesの整数倍・最大1316 bytesずつ順序どおり`sendto()`する。187 bytes以下の端数を次の読み取りへ保持し、EOF時の不完全なパケットは送信しない。通常の完全なTSストリームに欠落・重複・並べ替えを加えない。
+読み取り境界とTSパケット境界は一致しない。読み取ったデータを一時バッファへ追記し、1316 bytes（188×7）ずつ順序どおり`sendto()`する。1316 bytes未満は次の読み取りへ保持し、正常EOF時だけ188 bytesの整数倍の残りを送信する。停止時の末尾と188 bytes未満の端数は破棄する。送信障害がない場合、完全なTSパケットに欠落・重複・並べ替えを加えない。500 kbit/sを一定に出力する場合の1316 bytes蓄積時間は理論上約21msだが、実際の出力が途切れれば蓄積待ちは長くなる。
 
-送信スレッドの例外は保持してワーカーへ通知し、元の例外を原因としてログへ出す。stdoutのEOFも停止として検出する。障害時はreadyを解除して送信停止を通知し、FFmpegをterminate、200msで終了しなければkillしてさらに200ms待つ。stdin/stdoutを閉じ、送信スレッドを最大500msでjoinし、socketとフレーム待ち行列を解放する。約3秒後に再試行する。消灯やOFFでも同じ後片付けを行い、点灯・ON時は自動再開する。
+一時的な送信エラー（`BlockingIOError`、`EAGAIN`、`EWOULDBLOCK`、`ENOBUFS`、`EINTR`、`TimeoutError`とWindowsの対応コード）は、そのデータグラムだけを破棄して送信を続行する。`datagrams_sent`、`datagrams_dropped`、`bytes_sent`を記録し、破棄の警告は初回と以後5秒間隔に集約する。`ENETDOWN`、`ENODEV`、`EADDRNOTAVAIL`などの致命的な障害は保持してワーカーへ通知し、元のerrnoと例外のreprをcloudlogへ出す。stdoutのEOFも停止として検出する。障害時はreadyを解除して送信停止を通知し、FFmpegをterminate、200msで終了しなければkillしてさらに200ms待つ。stdin/stdoutを閉じ、送信スレッドを最大500msでjoinし、socketとフレーム待ち行列を解放する。約3秒後に再試行する。消灯やOFFでも同じ後片付けを行い、点灯・ON時は自動再開する。
 
 ## comma 3Xでの準備
 
@@ -127,7 +127,7 @@ ffmpeg -hide_banner -muxers | grep mpegts
 
 ```sh
 python -c 'from openpilot.common.params import Params; from openpilot.system.ui.lib.screen_stream import wifi_address; from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig; p = Params(); print(p.get_bool("ScreenStreamEnabled")); print(ScreenStreamConfig.from_params(p)); print(wifi_address())'
-pgrep -af ffmpeg
+pgrep -a -x ffmpeg
 ```
 
 FFmpegの出力先が`pipe:1`であり、プロセスがすぐに終了しないことを確認する。受信PCではREADMEのFFplayコマンドで映像を確認する。受信側FFplayのUDP機能は引き続き必要。OFFや消灯でFFmpegが終了し、再開時に復帰することも確認する。
@@ -141,6 +141,45 @@ python -c 'from openpilot.common.params import Params; Params().put_bool("Screen
 OFFへ戻すには`True`を`False`へ変更する。ブランチのロールバックは、記録した元のブランチへ切り替え、サブモジュールを同期して再起動する。
 
 送信先アドレス・ポートを変更した場合は、以下の受信URLにも同じ値を指定する。
+
+## 実機での再起動診断
+
+利用者からは、comma 3XからPCへH.264 Constrained Baseline / yuv420p / 800×480 / 20fpsの映像が届く一方で、受信側のTS破損・DTS順序エラーとFFmpeg PIDの周期的変化が報告されている。Wi-Fi tupleと設定は30回の照会で安定し、単独stdinベンチマークでは50フレーム中の最大書き込み時間が114.2msだった。productionのスケジューラ・負荷条件は同一ではないため、再起動の根本原因は未確定。以下の理由別ログで判別する。
+
+ログは`openpilot.common.swaglog.cloudlog`を使用し、通常のopenpilot環境ではlogmessaged経由で保存する。journalctlだけでは見えない場合がある。
+
+```sh
+# 実際のFFmpeg PIDとコマンド
+pgrep -a -x ffmpeg
+watch -n 0.2 'pgrep -a -x ffmpeg'
+
+# 再起動理由、起動時のPIDと設定、UDP破棄の集計
+grep -R -a "screen stream restart" /data/log 2>/dev/null | tail -50
+grep -R -a "screen stream started" /data/log 2>/dev/null | tail -20
+grep -R -a "screen stream UDP drops" /data/log 2>/dev/null | tail -20
+```
+
+| ログ | 内容 |
+| --- | --- |
+| `screen stream started:` | PID、Wi-Fi tuple、宛先、ビットレート、TTL |
+| `screen stream stopped:` | PID、終了コード、停止理由（`stream disabled`、`screen invisible`、`shutdown`など） |
+| `screen stream restart: ffmpeg exited` | FFmpeg自身の終了と終了コード |
+| `screen stream restart: frame pipe broken` | stdin破損、errno、終了コード、例外 |
+| `screen stream restart: frame write timeout` | フレームage、書き込み開始からの経過時間、残りbytes |
+| `screen stream restart: sender fatal error` | 元のerrnoと例外のrepr。生成時の失敗も区別 |
+| `screen stream restart: sender EOF` | stdoutの終了 |
+| `screen stream restart: invalid config` / `network query error` | 設定読み取り・Wi-Fi照会の失敗 |
+| `screen stream restart: encoder start failed` | FFmpeg欠落などの起動失敗 |
+| `screen stream restart: network changed` / `config changed` | 変更前後の値。両方変更された場合は同じ行に記録 |
+| `screen stream state:` | 起動・復帰時の状態変更、Wi-Fi未接続 |
+| `screen stream UDP drops:` | 累積破棄数、成功数、最後のerrno。初回と以後5秒間隔 |
+| `screen stream sender stopped:` | 送信成功数、破棄数、送信bytesの最終集計 |
+
+再起動ログの`count=`はワーカー内の再起動回数で、UIプロセスを起動し直すとリセットする。手動OFF・消灯による停止は障害回数に含めない。安定した1秒周期の照会ではログを増やさない。想定外の例外は`screen stream restart: unexpected error`、ワーカー自体の終了は`screen stream worker failed`で記録する。
+
+古いフレームの破棄や一時的なUDP送信失敗ではFFmpegを再起動しない。ネットワーク・設定変更では送信側とエンコーダを再生成する。OFF・消灯では停止し、ON・点灯で再開する。
+
+パケット破棄は映像欠損として見える可能性がある。GOP 10 / 20fpsならIDRの間隔は約0.5秒だが、継続的な通信損失や受信側の状態によって復旧は遅れる。再起動抑制が実機で改善したかは、PID・理由ログ・破棄数と受信映像を合わせて確認する。
 
 ## 受信と切り分け
 
@@ -174,8 +213,10 @@ GPU統合テストはOpenGLコンテキストとFFmpeg、ループバック上�
 
 2026-09-22の開発PCでの結果:
 
-- Python 3.12、Windows、Raylib 6.1-dev、FFmpeg 7.1で単体テスト44件とGPU統合テスト2件が成功。
-- 不規則なstdout読み取り境界からのTS再構成、EOF端数破棄、socket設定、送信・読み取り障害の通知、送信スレッド終了を確認。
+- Python 3.12、Windows、Raylib 6.1-dev、FFmpeg 7.1で単体テスト54件とGPU統合テスト2件が成功。
+- 不規則なstdout読み取り境界からの1316 bytes集約、正常EOFの端数送信、不完全なTS端数破棄、socket設定、致命的障害の通知、送信スレッド終了を確認。
+- EAGAIN・ENOBUFS・EINTRなどの注入で送信継続とFFmpegの維持、破棄数・成功数・送信bytesを確認。100回の破棄で警告が100回出ないことを検証。
+- フレーム鮮度と書き込み期限の分離、古いフレームだけの破棄、実際のパイプ停止による再起動、原因別cloudlogメッセージと再起動回数を検証。
 - 無効時の無通信、最新フレームへの置き換え、Wi-Fi切断・再接続・IP変更、D-Bus障害、FFmpeg欠落・終了・書き込み停止からの復旧を確認。
 - GPU縮小・上下方向・黒帯、H.264 Constrained Baseline / 800×480 / 20fps / yuv420p / Bフレームなし、188 bytes単位のMPEG-TS、最大1316 bytesの実UDPマルチキャスト送受信と復号を確認。
 - Ruffによる変更Pythonファイルの検査を実施。
@@ -183,7 +224,7 @@ GPU統合テストはOpenGLコンテキストとFFmpeg、ループバック上�
 - 設定の境界値・不正値・URL文字列拒否・保存とキャンセル・録画中の編集無効化・OFF時の非表示・送信先変更時の再起動を確認。
 - 本家のPOローダーで12言語の翻訳収録を確認し、英語から日本語への切替と表示更新を検証。
 
-実機からはParamsの保存値とWi-Fi検出（wlan0）が正常で、標準FFmpegのUDP非対応によりエンコーダが即終了することが報告されている。本修正後のcomma 3X上での配信動作は未確認。開発PCの結果はcomma 3Xでの実測・本体ビルド・本家CI全体の成功を意味しない。Windowsには本家のLinuxネイティブ依存が揃わないため、本体UI全体の起動テストは未実施。
+実機からはParamsの保存値とWi-Fi検出（wlan0）が正常で、標準FFmpegのUDP非対応によりエンコーダが即終了することが報告されている。その後、Python socket経由のPC受信成功と周期的なFFmpeg再起動が報告されている。本修正後の実機での再起動抑制と破棄率は未確認。開発PCの結果はcomma 3Xでの実測・本体ビルド・本家CI全体の成功を意味しない。Windowsには本家のLinuxネイティブ依存が揃わないため、本体UI全体の起動テストは未実施。Windowsテストではswaglogのネイティブ依存をモックへ差し替え、cloudlogへ渡すメッセージを検証する。実際のlogmessaged経由でのディスク保存は実機確認が必要。
 
 ## 実機テスト記録
 

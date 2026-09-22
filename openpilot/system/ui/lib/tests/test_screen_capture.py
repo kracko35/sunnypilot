@@ -4,6 +4,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from openpilot.system.ui.lib.tests.screen_stream_test_support import load_screen_stream
+
+load_screen_stream()
 from openpilot.system.ui.lib import screen_capture as capture
 
 

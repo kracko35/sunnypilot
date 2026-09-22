@@ -1,8 +1,20 @@
-# UDP画面配信: ultra low latency experimental
+# 画面ストリーミング: ultra low latency experimental
 
 ## 目的と実機状況
 
 comma 3X → Windows PCのunicastを基本候補とし、glass-to-glass 100ms以下を目標に計測と調整を行う実験版。100ms達成を保証するものではなく、本変更後の実機遅延は未測定。MIB・MOST・AIDは変更しない。H.264 / MPEG-TS / UDPを維持し、multicastも残す。
+
+最新の利用者報告（`7637bf720ff3f775a2f9b2a69f93556e1ca7b451`）では、定常区間のsender_dropsとsendto_eagain_countは0、socket_sndbufは229376。観測区間ではUDP混雑が解消している。以下は各window平均の概数で、端末間の表示遅延ではない。
+
+| kbit/s | capture→UDP send | stdin write | stdin complete→PES | PES→send | FFmpeg CPU |
+| --- | --- | --- | --- | --- | --- |
+| 500 | 45～56ms | 14～19ms | 26～29ms | 0.5～1.1ms | 約45% |
+| 1000 | 48～54ms | 15～17ms | 28～30ms | 0.6～0.9ms | 約47% |
+| 1500 | 61～67ms | 17～22ms | 35～39ms | 0.9～1.4ms | 約52% |
+
+一方、100msのframe write timeoutが複数回発生し、remaining_bytes=1470464が繰り返される。1536000−1470464=65536 bytesを書いた後の停止で、FFmpeg起動直後にstdinをまだ消費できず、パイプが埋まった可能性がある。Linuxのパイプ容量は一般に16ページ（4KiBページなら64KiB）だが、環境や制限で異なる。ログだけで実容量・初回frame・原因を確定できないため、新しいfirst_frameとprocess_uptimeのログで検証する。少数のremaining_bytes=618496／94208も区別して残す。[pipe(7)](https://man7.org/linux/man-pages/man7/pipe.7.html)
+
+以下の`fe6f5b3`の記録は混雑修正前の比較資料。
 
 利用者による`fe6f5b32953171882c9bd13968998a4b0d906887`の実機報告:
 
@@ -43,7 +55,7 @@ ffmpeg -hide_banner -muxers 2>/dev/null | grep mpegts
 
 必要なのはlibx264、MPEG-TS、file/pipe。comma標準FFmpegのUDP非対応でもPython socketで送信する。hardware H.264 encoderは実機のcapability確認後に判断し、自動選択しない。Windowsの`.venv`は端末へコピーしない。
 
-設定 → トグル → UDP Screen Streaming（日本語: UDP画面配信）をONにする。Destination AddressをPCのWi-Fi IPv4、ポート12346、最初は500 kbit/sに設定。1000、1500へ変更して各条件で約10秒ウォームアップし、その後30秒以上測定して5秒statsを複数採取する。保存直後のsenderとFFmpegの再生成は正常であり、試験途中の障害再起動と区別する。
+設定 → トグル → Screen Streaming（日本語: 画面ストリーミング）をONにする。Destination AddressをPCのWi-Fi IPv4、ポート12346、最初は500 kbit/sに設定。1000、1500へ変更して各条件で約10秒ウォームアップし、その後30秒以上測定して5秒statsを複数採取する。保存直後のsenderとFFmpegの再生成は正常であり、試験途中の障害再起動と区別する。
 
 ## 設定と互換性
 
@@ -79,12 +91,13 @@ wallclockのみ、wallclock＋fps_mode passthrough、さらにcopyts / start_at_
 | x264 params | repeat-headers=1 | sync-lookahead=0:rc-lookahead=0:sliced-threads=1:repeat-headers=1 |
 | VBV bufsize | bitrate / 3 | bitrate / 10 |
 | FRAME_MAX_AGE | 250ms | 75ms |
-| PIPE_WRITE_TIMEOUT | 500ms | 100ms |
+| PIPE_WRITE_TIMEOUT（定常frame） | 500ms | 100ms |
+| FIRST_FRAME_WRITE_TIMEOUT（プロセスの初回完全writeまで） | 共通期限 | 500ms |
 | スケジューラ | SCHED_OTHER、nice +10 | SCHED_OTHER、niceを変更しない |
 
 維持: 800×480、最大20fps、libx264、zerolatency、baseline、yuv420p、B=0、GOP=10、keyint_min=10、sc_threshold=0、threads=2、muxdelay=0、muxpreload=0、flush_packets=1、MPEG-TSのpipe:1出力。500 / 1500 / 3000 kbit/sのVBVは50 / 150 / 300 kbitで、開発PCのlibx264ではエラーや最小値へのclamp警告は出なかった。VBVはrate-controlの容量であり、その値を実際の100ms待機と解釈しない。
 
-75ms以上古い未送信frameは、FFmpegへ入れる前に丸ごと破棄する。rawvideoを途中まで書いた後に100msの期限へ達した場合は、境界を壊さないようFFmpegごと再生成する。2つの上限は独立し、合計100ms以下を保証しない。今回captured + 100msの絶対期限は追加しない。まず送信負荷と混雑を改善し、frame ageと再起動頻度を取り直す。
+75ms以上古い未送信frameは、FFmpegへ入れる前に丸ごと破棄する。書き込み期限は開始から通常100ms、プロセスの最初の完全writeだけ500ms。途中で期限に達した場合は、rawvideoの境界を壊さないようFFmpegごと再生成する。queueの上限とwrite期限は独立し、合計100ms以下を保証しない。captured + 100msの絶対期限は追加しない。
 
 配信ワーカーでSCHED_OTHERへ変更してからmonitor・sender・FFmpegを起動する。意図的なnice +10を廃止し、nice 0への昇格操作も行わない。親プロセスのniceを継承するため、通常priorityで起動していることは実機で確認する。CAP_SYS_NICEを必要とするpriority上昇やrealtime化は行わない。
 
@@ -105,7 +118,7 @@ TSの欠落はH.264の破損につながるため、大量dropを正常と扱わ
 
 Linuxでは非ブロッキングstdoutのEAGAIN後にselectで可読通知を待つ。50msは停止確認のための最大待機で、データ到着時は即時に起きる。Windowsの匿名パイプはselect非対応なので、開発PCでは1ms待機を使う。
 
-強制SO_SNDBUF=16 KiBを撤廃し、getsockoptでOS既定の実値を読み、起動・統計ログへ出す。変更後のcomma実値は未測定。容量を戻すことでdropの改善を狙うが、bufferが大きいほど遅延が小さいとは限らないのでoutq・frame age・端末間遅延を併せて確認する。[socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html)
+強制SO_SNDBUF=16 KiBを撤廃し、getsockoptでOS既定の実値を読み、起動・統計ログへ出す。7637bf72のcomma実測は229376。容量を戻すことでdropの改善を狙うが、bufferが大きいほど遅延が小さいとは限らないのでoutq・frame age・端末間遅延を併せて確認する。[socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html)
 
 LinuxのTIOCOUTQはstdout読み取りバッチの送信後と統計出力時に呼び出し機会を持つが、共通の100ms制限によりioctlは最大約10回/秒に抑える。packetごとには取得しない。アイドル時の厳密な100ms周期は保証しない。取得失敗は配信障害にせずcurrent=Noneとする。peakはsender生成以降、window_peakは前回統計以降のサンプル最大値で、統計出力時にwindowだけリセットする。サンプルがなければNone。未観測の瞬間ピークや無線ドライバー・AP・受信側のキューは含まない。[udp(7)](https://man7.org/linux/man-pages/man7/udp.7.html)
 
@@ -118,7 +131,7 @@ LinuxのTIOCOUTQはstdout読み取りバッチの送信後と統計出力時に�
 
 概算はbitrate / (8 × payload)、ネットワーク等のoverheadは別。各datagramでsendtoを1回行う。564 bytes分の連続入力時間は1500 kbit/sで約3ms、500で約9msとなり、送信回数と集約待ちの折衷とする。実際の映像出力はVBR・バーストなので、この値は待ち時間の上限ではない。ベンチマークは実際のTS長から全4候補の送信回数も計算する。
 
-実機A/Bは`openpilot/system/ui/lib/screen_stream.py`のUNICAST_TS_PACKETS_PER_DATAGRAMだけを1／2／3／7へ変更し、他条件を固定する。追加UIは設けない。FRAME_MAX_AGE、PIPE_WRITE_TIMEOUT、OUTQ_SAMPLE_INTERVAL、LATENCY_STATS_INTERVAL、UDP_CONGESTION_RATIO_PCT、UDP_CONGESTION_MIN_ATTEMPTS、ENCODER_PRESETも先頭へまとめる。環境変数による暗黙のoverrideは追加しない。
+実機A/Bは`openpilot/system/ui/lib/screen_stream.py`のUNICAST_TS_PACKETS_PER_DATAGRAMだけを1／2／3／7へ変更し、他条件を固定する。追加UIは設けない。FRAME_MAX_AGE、PIPE_WRITE_TIMEOUT、FIRST_FRAME_WRITE_TIMEOUT、OUTQ_SAMPLE_INTERVAL、LATENCY_STATS_INTERVAL、UDP_CONGESTION_RATIO_PCT、UDP_CONGESTION_MIN_ATTEMPTS、ENCODER_PRESETも先頭へまとめる。環境変数による暗黙のoverrideは追加しない。
 
 ## 監視とキャプチャ
 
@@ -133,6 +146,66 @@ GPU readbackは同期方式を維持し、今回この経路を変更しない�
 キャプチャ位置は`application.py`のend_drawing後を維持する。RenderTextureはend_texture_mode直後に完成するが、そこへ同期readbackを移すとローカル画面表示を遅らせる可能性がある。効果を実機で確認できないため移動せず、描画途中のtextureは読まない。描画完了からキャプチャ開始までの表示待ち時間は今回のcapture統計には含まない。
 
 ## 実機での再起動診断と遅延統計
+
+### 初回stdin書き込みの起動猶予
+
+プロセス生成のたびにfirst_frame_writtenをFalseとし、最初のraw RGBA 1枚が全て書けるまでだけFIRST_FRAME_WRITE_TIMEOUT=500msを使う。完全write後はTrueとなり、以降のPIPE_WRITE_TIMEOUT=100msを維持する。障害・設定変更・ネットワーク変更の新プロセスはいずれもFalseから始める。固定warm-up sleepはなく、即座に消費できればすぐ終了する。queueは最新1枚のままで、起動中に置換された未送信frameも蓄積しない。
+
+途中のraw frameを捨てて同じstdinへ次を送ることはしない。初回でも通常でも期限超過は既存の例外経路でプロセスを閉じて再生成する。sender・observerも毎回新規生成され、旧世代のrecord/PESを引き継がない。1500 kbit/sの一部セッションのpts_discontinuityは今回緩和せず、rolling confirmation・PTS検査・PESとdatagramの対応も変更しない。
+
+通常の5秒statsと終了時finalに次の値を追加する。初回成功の値はそのプロセスの全windowで保持し、新プロセスでNoneへ戻す。未成功はNone、first_frame_written=0とし、失敗の経過はtimeoutログで読む。
+
+| 追加統計 | 意味・保持期間 |
+| --- | --- |
+| first_frame_written | 現プロセスの初回完全write成功なら1、それまでは0 |
+| first_frame_write_ms | 初回write開始から全bytes書き込み完了まで |
+| first_frame_blocked_wait_ms | 初回のBlockingIOError後のselect等の待ち合計 |
+| first_frame_write_syscalls / first_frame_blocked_events | 初回のos.write試行数（EAGAINを含む）／BlockingIOError数 |
+| first_frame_bytes_written | 初回成功bytes。800×480 RGBAなら1536000 |
+| process_start_to_first_frame_complete_ms | Popen呼び出し直前のmonotonic時刻から初回完全writeまで。プロセス生成・sender設定・最初の入力を待つ時間も含む |
+| first_frame_write_timeout_count | ScreenStreamer生成以来の初回timeout累積。FFmpeg再起動・設定変更ではリセットしない |
+| regular_frame_write_timeout_count | 同じ期間の通常frame timeout累積。UIプロセス再起動では両カウンターとも0へ戻る |
+
+既存stdin_write_syscalls、stdin_blocked_events、stdin_blocked_wait_ms／max_msにも初回の実測を含める。起動を含むwindowと定常windowは分けて比較する。成功値は定期・final統計にだけ追加し、frameごとのログは増やさない。
+
+timeoutの例（値は形式説明用）:
+
+```text
+screen stream restart: frame write timeout age=0.506s write_elapsed=0.500s first_frame=1 written_bytes=65536 remaining_bytes=1470464 blocked_events=10 blocked_wait_ms=498.000 process_uptime_ms=510.0 count=1
+```
+
+ageはcapture開始から、write_elapsedは今回write開始から、process_uptime_msはPopen開始から。written_bytesは成功writeの合計で、remaining_bytesと合わせて1枚のサイズになる。blocked_eventsとblocked_wait_msは今回のwriteだけを表す。
+
+実機更新後は500／1000／1500 kbit/sで各10秒warm-up＋30秒以上測定する。変更直後からのrestart/finalログも保存し、warm-upで起動失敗の記録を除外しない。特にfirst_frame=1・remaining_bytes=1470464の繰り返しが消える／大幅減少するか、初回成功時間が100msを超えてもPIDが安定するかを見る。通常timeout回数、stdin/PES/sendの定常平均・最大、diag_active／diag_reason、sender_drops、sendto_eagain_countも前掲実測と比較する。成功していても常に500ms待つ、通常frameが古く溜まる、通常の100ms期限が延びる状態は不合格。
+
+```sh
+HASH=$(git rev-parse HEAD)
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null \
+  | grep "frame write timeout" | tail -30
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null \
+  | grep "screen stream latency stats:" | tail -30
+```
+
+### 表示名と保存設定
+
+機能名は英語Screen Streaming、日本語「画面ストリーミング」。両Settingsレイアウトの共通STREAM_TITLE、本家tr／tr_noop、app.potと12言語のPOを使う。POは英語原文をmsgidとするためタイトルのmsgidだけを新しい原文へ更新する。独立した翻訳IDやSTREAM_TITLE定数名、Params／configの識別子は変更しない。ScreenStreamEnabled、ScreenStreamAddress、ScreenStreamPort、ScreenStreamBitrate、ScreenStreamTtlをそのまま読み、設定migrationは不要。技術用語のUDP Port、UDP unicast、MPEG-TS / UDPと説明文は維持する。
+
+### 起動猶予変更の開発PC検証（2026-09-22）
+
+Windows／Python 3.12／FFmpeg 7.1で139テスト中136成功、画面／OpenGL初期化不可のGPU関連3件はskip。最初の64KiB後にEAGAINを返す模擬consumerで、初回120msと300msは再起動なし、500ms超はpartial frameごとプロセス再起動、初回成功後の2枚目120msは通常100ms期限で再起動する。障害・設定・ネットワーク変更後も初回猶予を使用できる。成功値の保持・新世代でのリセット、累積timeout数、timeoutの詳細フィールド、200frame／20fpsの既存stdin集計とobserverへ渡す時刻も確認。設定UIの8テストで保存済み値・ON/OFF・宛先／port／bitrate／TTL・両レイアウト・日英表示・12言語POを検証した。
+
+既存のmarker benchmarkを各100frame、500／1000／1500／3000 kbit/sで実行した。observer ONは全条件diag_active=1、diag_sync_lost=0、encoder_pes_samples=100。入力marker・復号marker・PES PTSとの照合は全件一致し、平均／p95／最大の丸め誤差は0.0005ms以内。
+
+| kbit/s | throughput ON / OFF（fps） | stdin write平均 ON / OFF（ms） | stdin complete→PES平均 ON / OFF（ms） |
+| --- | --- | --- | --- |
+| 500 | 20.079 / 20.078 | 1.330 / 1.320 | 9.343 / 9.253 |
+| 1000 | 20.172 / 20.170 | 1.096 / 1.156 | 7.462 / 8.077 |
+| 1500 | 20.071 / 20.171 | 1.103 / 0.462 | 7.647 / 2.610 |
+| 3000 | 20.082 / 20.076 | 1.315 / 0.906 | 9.919 / 6.714 |
+
+20fpsで投入する既存pipe-only harnessの単発比較であり、最大処理能力や変更前後の厳密な性能差を示すものではない。harnessは独自のstdin writerを使うため、起動期限自体は上記production writerのテストで検証する。実FFmpeg＋本番UDP senderの合成映像の往復・PES照合テストも成功したが、Windowsの時間計測・スケジューリングにばらつきがあり、commaの定常stdin/PES/send遅延が悪化していないことは実機で確認する。encoderコマンド・transport・observer本体・stage定義に差分はない。Ruffとgit diff --checkは成功。
+
+### 現在のコミットだけを抽出する
 
 ```sh
 HASH=$(git rev-parse HEAD)
@@ -186,7 +259,7 @@ capture～frames_writtenと時間統計は前回ログからの区間値で、�
 
 ## 実UI配信のstage観測
 
-`4d032be`で送信側の564-byte集約・OS既定SO_SNDBUF・100ms outq取得・区間drop統計を導入した。今回それらの値とGPU、FFmpegコマンド、20fps、75ms／100ms期限、receiverを固定し、未観測だったstdin→PES→UDPの区間を追加する。変更後のcomma実測はまだなく、送信混雑の改善量も未確認。
+`4d032be`で送信側の564-byte集約・OS既定SO_SNDBUF・100ms outq取得・区間drop統計を導入した。stage計測の導入ではそれらの値とGPU、FFmpegコマンド、20fps、75ms／通常100ms期限、receiverを固定した。7637bf72の実機結果は冒頭に示す。今回の期限変更は初回完全writeの500msだけ。
 
 本番モジュール`screen_stream_latency.py`はtestsをimportしない。UIで受理したframeには単調増加のsequenceを付け、FFmpegへの書き込み開始前にsequence・capture開始・dequeue・stdin開始を登録する。書き込み完了は後から結合する。キュー置換やstale破棄で書き込まなかったsequenceの空白は許容し、書き込み対象の順序でPESへ仮対応する。
 
@@ -393,7 +466,7 @@ JSONのframe_timingsにinput_arrival_s、stdin_complete_s、pts_90k、stdout_fir
 
 ### commaで逆圧を比較する診断
 
-通常のUDP Screen StreamingをOFFにし、競合するFFmpegがない状態で実行する。`--frames 400`なら各bitrate約20秒。最初はパイプ単独、次に同じ条件で本番MpegTsUdpSenderを通す。送信元・宛先は実際のWi-Fi IPv4へ置換し、UDP時はPCでreceiverを1つ起動する。
+通常のScreen StreamingをOFFにし、競合するFFmpegがない状態で実行する。`--frames 400`なら各bitrate約20秒。最初はパイプ単独、次に同じ条件で本番MpegTsUdpSenderを通す。送信元・宛先は実際のWi-Fi IPv4へ置換し、UDP時はPCでreceiverを1つ起動する。
 
 ```sh
 SCREEN_STREAM_TEST_FFMPEG=/usr/bin/ffmpeg python -m openpilot.system.ui.lib.tests.benchmark_screen_stream --frames 400 --output /tmp/stream-pipe.json

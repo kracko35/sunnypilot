@@ -31,6 +31,7 @@ RETRY_INTERVAL = 3.0
 NETWORK_REQUEST_TIMEOUT = 0.25
 FRAME_MAX_AGE = 0.075
 PIPE_WRITE_TIMEOUT = 0.10
+FIRST_FRAME_WRITE_TIMEOUT = 0.50
 TS_PACKET_SIZE = 188
 MULTICAST_TS_PACKETS_PER_DATAGRAM = 7
 UNICAST_TS_PACKETS_PER_DATAGRAM = 3
@@ -353,6 +354,11 @@ class ScreenStreamer:
     self._proc: subprocess.Popen | None = None
     self._sender: MpegTsUdpSender | None = None
     self._restart_count = 0
+    self._first_frame_written = False
+    self._process_started_at: float | None = None
+    self._first_frame_metrics: dict[str, float | int | None] = {}
+    self._first_frame_write_timeout_count = 0
+    self._regular_frame_write_timeout_count = 0
     self._network_query_failures = 0
     self._last_network_error_log: float | None = None
     self.stats = LatencyStats()
@@ -399,6 +405,10 @@ class ScreenStreamer:
     values.update(stats_window_s=round(elapsed, 6), capture_fps=round(values['capture_count'] / elapsed, 3),
                   submitted_fps=round(values['submitted_count'] / elapsed, 3), frames_written_fps=round(values['frames_written'] / elapsed, 3))
     values.update(sender.stats_snapshot(now))
+    values.update(self._first_frame_metrics)
+    values.update(first_frame_written=int(self._first_frame_written),
+                  first_frame_write_timeout_count=self._first_frame_write_timeout_count,
+                  regular_frame_write_timeout_count=self._regular_frame_write_timeout_count)
     if self._latency is not None:
       values.update(self._latency.snapshot(now, elapsed, final=final_reason is not None))
     if self._usage is not None:
@@ -483,7 +493,8 @@ class ScreenStreamer:
     assert self._proc is not None and self._proc.stdin is not None
     remaining = memoryview(data)
     started = time.monotonic()
-    deadline = started + PIPE_WRITE_TIMEOUT
+    first_frame = not self._first_frame_written
+    deadline = started + (FIRST_FRAME_WRITE_TIMEOUT if first_frame else PIPE_WRITE_TIMEOUT)
     observer = self._latency
     if observer is not None:
       observer.begin(sequence, captured, started if dequeued is None else dequeued, started)
@@ -499,7 +510,15 @@ class ScreenStreamer:
         now = time.monotonic()
         if now >= deadline:
           # rawvideoの途中を破棄すると次フレームの境界が壊れるため、プロセスごと再開する。
-          raise FrameWriteTimeout(f"frame write timeout age={now - captured:.3f}s write_elapsed={now - started:.3f}s remaining_bytes={len(remaining)}")
+          if first_frame:
+            self._first_frame_write_timeout_count += 1
+          else:
+            self._regular_frame_write_timeout_count += 1
+          uptime = (now - self._process_started_at) * 1000 if self._process_started_at is not None else None
+          raise FrameWriteTimeout(f"frame write timeout age={now - captured:.3f}s write_elapsed={now - started:.3f}s " +
+                                  f"first_frame={int(first_frame)} written_bytes={size} remaining_bytes={len(remaining)} " +
+                                  f"blocked_events={blocked} blocked_wait_ms={wait * 1000:.3f} " +
+                                  f"process_uptime_ms={round(uptime, 3) if uptime is not None else None}")
         try:
           calls += 1
           written = os.write(self._proc.stdin.fileno(), remaining)
@@ -519,6 +538,19 @@ class ScreenStreamer:
           maximum = max(maximum, elapsed)
         except OSError as error:
           raise ScreenStreamError(f"frame pipe broken: rc={self._proc.poll()} errno={error.errno} error={error!r}") from error
+      if first_frame:
+        # 最初の完全writeだけ起動猶予を使う。値は次のプロセス生成まで保持する。
+        completed = time.monotonic()
+        self._first_frame_metrics = {
+          'first_frame_write_ms': round((completed - started) * 1000, 3),
+          'first_frame_blocked_wait_ms': round(wait * 1000, 3),
+          'first_frame_write_syscalls': calls,
+          'first_frame_blocked_events': blocked,
+          'first_frame_bytes_written': size,
+          'process_start_to_first_frame_complete_ms': (round((completed - self._process_started_at) * 1000, 3)
+                                                      if self._process_started_at is not None else None),
+        }
+        self._first_frame_written = True
     finally:
       self.stats.record_stdin(calls, blocked, size, wait, maximum)
       if observer is not None:
@@ -606,6 +638,13 @@ class ScreenStreamer:
               self._stop.wait(0.1)
               continue
             try:
+              # Popenの開始を基準とし、設定変更・障害再起動も必ず新しい起動状態にする。
+              self._process_started_at = time.monotonic()
+              self._first_frame_written = False
+              self._first_frame_metrics = dict.fromkeys((
+                'first_frame_write_ms', 'first_frame_blocked_wait_ms', 'first_frame_write_syscalls',
+                'first_frame_blocked_events', 'first_frame_bytes_written', 'process_start_to_first_frame_complete_ms',
+              ))
               self._proc = subprocess.Popen(ffmpeg_command(current_config), stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
             except OSError as error:
               raise ScreenStreamError(f"encoder start failed: errno={error.errno} error={error!r}") from error

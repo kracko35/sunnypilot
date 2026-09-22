@@ -910,6 +910,6 @@ msgid "UDP Port"
 msgstr ""
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
-msgid "UDP Screen Streaming"
+msgid "Screen Streaming"
 msgstr ""
 

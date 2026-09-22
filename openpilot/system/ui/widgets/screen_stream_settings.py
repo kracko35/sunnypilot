@@ -8,7 +8,7 @@ from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.lib.screen_stream_config import PARAM_KEYS, ScreenStreamConfig, parse_stream_setting
 from openpilot.system.ui.widgets import DialogResult
 
-STREAM_TITLE = tr_noop("UDP Screen Streaming")
+STREAM_TITLE = tr_noop("Screen Streaming")
 STREAM_DESCRIPTION = tr_noop(
   "Stream the UI over Wi-Fi. Recording or display sleep pauses streaming. Anyone on the same network can view the stream."
 )

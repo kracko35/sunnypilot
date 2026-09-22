@@ -143,6 +143,8 @@ class TestScreenStreamSettings(unittest.TestCase):
     self.assertNotIn('ScreenStreamPort', self.params.values)
 
   def test_language_switch_uses_standard_catalogs(self):
+    self.assertEqual(self.ui.STREAM_TITLE, 'Screen Streaming')
+    self.assertEqual(self.multilang.tr(self.ui.STREAM_TITLE), 'Screen Streaming')
     settings = self.ui.ScreenStreamSettings(self.params)
     compact = self.ui.ScreenStreamSettings(self.params, compact=True)
     self.assertEqual(settings.items['address'].title(), 'Destination Address')
@@ -151,7 +153,20 @@ class TestScreenStreamSettings(unittest.TestCase):
     compact.refresh(force=True)
     self.assertEqual(settings.items['address'].title(), '送信先アドレス')
     self.assertEqual(compact.items['address'].title, '送信先アドレス')
-    self.assertEqual(self.multilang.tr(self.ui.STREAM_TITLE), 'UDP画面配信')
+    self.assertEqual(self.multilang.tr(self.ui.STREAM_TITLE), '画面ストリーミング')
+
+  def test_saved_settings_survive_display_name_change_on_both_layouts(self):
+    saved = {'ScreenStreamEnabled': True, 'ScreenStreamAddress': '192.168.4.44', 'ScreenStreamPort': 23456,
+             'ScreenStreamBitrate': 1000, 'ScreenStreamTtl': 2}
+    self.params.values = saved.copy()
+    for compact in [False, True]:
+      settings = self.ui.ScreenStreamSettings(self.params, compact=compact)
+      self.assertTrue(all(item.visible and item.enabled for item in settings.items.values()))
+      self.assertEqual(settings.items['address'].value, saved['ScreenStreamAddress'])
+      self.assertEqual(settings.items['port'].value, '23456')
+      self.assertEqual(settings.items['bitrate'].value, '1000')
+      self.assertEqual(ScreenStreamConfig.from_params(self.params), ScreenStreamConfig('192.168.4.44', 23456, 1000, 2))
+      self.assertEqual(self.params.values, saved)
 
   def test_all_supported_languages_include_translated_stream_strings(self):
     entries = extract_strings([UI_SOURCE], str(ROOT))

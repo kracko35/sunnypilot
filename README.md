@@ -18,7 +18,7 @@ Development stays on `udp-screen-streaming`. Future upstream PRs target master; 
 ## 使い方 / Usage
 
 1. 配信パラメーターを含むソースをビルドし、commaとPCを同じWi-Fiへ接続します。 / Build the source with streaming parameter keys and connect comma and the PC to the same Wi-Fi.
-2. Settings → Toggles → “UDP Screen Streaming”（日本語: UDP画面配信）をONにします。既定はOFFです。 / Enable “UDP Screen Streaming” in Settings → Toggles. It is off by default.
+2. Settings → Toggles → “Screen Streaming”（日本語: 画面ストリーミング）をONにします。既定はOFFです。 / Enable “Screen Streaming” in Settings → Toggles. It is off by default.
 3. “Destination Address”（送信先アドレス）にPCのWi-Fi IPv4（例: `192.168.4.44`）、ポートに`12346`を指定します。設定変更は自動反映されます。 / Set Destination Address to the PC's Wi-Fi IPv4 (e.g. `192.168.4.44`) and port to `12346`. Saved changes apply automatically.
 4. 以下の受信コマンドを1つだけ起動します。500／1000／1500 kbit/sで、設定変更後約10秒のウォームアップに続けて各30秒以上測定します。 / Start one receiver below. At each of 500/1000/1500 kbit/s, warm up for about 10 seconds after changing settings, then measure for at least 30 seconds.
 
@@ -80,7 +80,7 @@ For multiline PowerShell commands, use a trailing backtick, not cmd's `^`. Omit 
 | Encoder | libx264 ultrafast, zerolatency, baseline, yuv420p, B=0, GOP=10, lookahead=0 |
 | VBV | bitrate / 10（1500 kbit/sなら150 kbit）/ 150 kbit at 1500 kbit/s |
 | 古い未送信frame / Stale pending frames | 75ms以上で破棄 / discard at 75 ms |
-| stdin書き込み期限 / Write deadline | 書き込み開始から100ms / 100 ms from write start |
+| stdin書き込み期限 / Write deadline | プロセスの初回完全writeは500ms、その後100ms / 500 ms for the first complete frame per process, then 100 ms from write start |
 | Unicast | 564 bytes/datagram（TS 3個）、SO_SNDBUFはOS既定値 / 3 TS packets, OS-default SO_SNDBUF |
 | Multicast | 従来どおり1316 bytes集約とTTL / existing 1316-byte coalescing and TTL |
 | 監視 / Monitoring | D-Bus・設定を別スレッドで照会 / separate D-Bus and configuration polling threads |

@@ -266,7 +266,9 @@ class TestScreenStreamer(unittest.TestCase):
       for field in ['capture_count=1', 'submitted_count=1', 'frames_written=1', 'capture_avg_ms=20.0', 'readback_max_ms=15.0',
                     'queue_replaced_count=', 'stale_drop_count=', 'queue_age_avg_ms=', 'stdin_write_max_ms=', 'pid=',
                     'mode=multicast', 'bitrate=1500', 'sender_datagrams=', 'sender_drops=', 'sender_bytes=',
-                    'socket_sndbuf=', 'socket_outq_current=', 'socket_outq_peak=']:
+                    'socket_sndbuf=', 'socket_outq_current=', 'socket_outq_peak=', 'first_frame_written=1',
+                    'first_frame_write_ms=', 'first_frame_blocked_wait_ms=', 'process_start_to_first_frame_complete_ms=',
+                    'first_frame_write_timeout_count=0', 'regular_frame_write_timeout_count=0']:
         self.assertIn(field, message)
 
   def test_worker_drops_realtime_policy_without_lowering_nice(self):
@@ -583,13 +585,148 @@ class TestScreenStreamer(unittest.TestCase):
 
   def test_pipe_deadline_starts_at_write_not_capture(self):
     self.streamer._proc = Mock()
+    self.streamer._first_frame_written = True
     with patch.object(stream.time, 'monotonic', side_effect=[10.0, 10.0, 10.09]), \
          patch.object(stream.os, 'write', side_effect=[1, 2]) as write:
       self.streamer._write_frame(9.8, b'abc')
     self.assertEqual(write.call_count, 2)
 
+  def delayed_pipe(self, first_delay, regular_delay=0):
+    # 各プロセスの先頭64KiBを受け入れ、consumerが動くまではEAGAINを返す。
+    states = {}
+
+    def write(fd, data):
+      state = states.setdefault(len(self.processes), {'completed': 0, 'started': None})
+      if state['started'] is None:
+        state['started'] = time.monotonic()
+        return min(65536, len(data))
+      delay = first_delay if state['completed'] == 0 else regular_delay
+      if time.monotonic() - state['started'] < delay:
+        raise BlockingIOError
+      state['completed'] += 1
+      state['started'] = None
+      return len(data)
+
+    return write
+
+  def check_first_frame_delay(self, delay):
+    self.enabled = True
+    with patch.object(stream.os, 'write', side_effect=self.delayed_pipe(delay)):
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      self.streamer.submit(bytes(stream.FRAME_BYTES))
+      wait_until(lambda: self.streamer.stats.snapshot()['frames_written'] == 1)
+      self.assertTrue(self.streamer._first_frame_written)
+      self.assertEqual(self.streamer._restart_count, 0)
+      self.assertEqual(len(self.processes), 1)
+      metrics = self.streamer._first_frame_metrics.copy()
+      self.assertGreaterEqual(metrics['first_frame_write_ms'], delay * 1000)
+      self.assertGreater(metrics['first_frame_blocked_wait_ms'], 0)
+      self.assertGreater(metrics['first_frame_blocked_events'], 0)
+      self.assertGreater(metrics['first_frame_write_syscalls'], 2)
+      self.assertEqual(metrics['first_frame_bytes_written'], stream.FRAME_BYTES)
+      self.assertGreaterEqual(metrics['process_start_to_first_frame_complete_ms'], metrics['first_frame_write_ms'])
+      self.streamer.submit(bytes(stream.FRAME_BYTES))
+      wait_until(lambda: self.streamer.stats.snapshot()['frames_written'] == 2)
+      self.assertEqual(self.streamer._first_frame_metrics, metrics)
+      self.streamer.close()
+      final = next(call.args[0] for call in self.cloudlog.info.call_args_list if 'screen stream latency final:' in call.args[0])
+      for name, value in metrics.items():
+        self.assertIn(f'{name}={value}', final)
+      self.assertIn('first_frame_write_timeout_count=0', final)
+      self.assertIn('regular_frame_write_timeout_count=0', final)
+
+  def test_first_frame_120ms_does_not_restart(self):
+    self.check_first_frame_delay(.120)
+
+  def test_first_frame_300ms_does_not_restart_and_preserves_metrics(self):
+    self.check_first_frame_delay(.300)
+
+  def test_first_frame_partial_timeout_restarts_with_clean_startup_and_observer(self):
+    self.enabled = True
+    with patch.object(stream.os, 'write', side_effect=self.delayed_pipe(stream.FIRST_FRAME_WRITE_TIMEOUT + .1)):
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      observer = self.streamer._latency
+      self.streamer.submit(bytes(stream.FRAME_BYTES))
+      wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+      self.processes[0].terminate.assert_called_once()
+      self.processes[0].stdin.close.assert_called_once()
+      self.assertEqual(self.streamer._first_frame_write_timeout_count, 1)
+      self.assertEqual(self.streamer._regular_frame_write_timeout_count, 0)
+      self.assertFalse(self.streamer._first_frame_written)
+      self.assertTrue(all(value is None for value in self.streamer._first_frame_metrics.values()))
+      self.assertIsNot(observer, self.streamer._latency)
+      self.assertTrue(self.streamer._latency.active)
+      message = self.log_messages()
+      for field in ['first_frame=1', 'written_bytes=65536', 'remaining_bytes=1470464', 'blocked_events=',
+                    'blocked_wait_ms=', 'process_uptime_ms=', 'first_frame_write_timeout_count=1']:
+        self.assertIn(field, message)
+    with patch.object(stream.os, 'write', side_effect=self.delayed_pipe(.120)):
+      self.streamer.submit(bytes(stream.FRAME_BYTES))
+      wait_until(lambda: self.streamer.stats.snapshot()['frames_written'] == 1)
+      self.assertEqual(len(self.processes), 2)
+      self.assertGreaterEqual(self.streamer._first_frame_metrics['first_frame_write_ms'], 120)
+
+  def test_second_frame_120ms_restarts_at_regular_deadline(self):
+    self.enabled = True
+    with patch.object(stream.os, 'write', side_effect=self.delayed_pipe(0, .120)):
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      self.streamer.submit(bytes(stream.FRAME_BYTES))
+      wait_until(lambda: self.streamer.stats.snapshot()['frames_written'] == 1)
+      metrics = self.streamer._first_frame_metrics.copy()
+      self.streamer.submit(bytes(stream.FRAME_BYTES))
+      wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+      self.processes[0].terminate.assert_called_once()
+      self.assertEqual(self.streamer._regular_frame_write_timeout_count, 1)
+      self.assertEqual(self.streamer._first_frame_write_timeout_count, 0)
+      self.assertIn('first_frame=0', self.log_messages())
+      self.assertIn(f"first_frame_write_ms={metrics['first_frame_write_ms']}", self.log_messages())
+
+  def test_config_and_network_new_process_allow_first_frame_again(self):
+    self.enabled = True
+    with patch.object(stream.os, 'write', side_effect=self.delayed_pipe(.120)):
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      for generation in range(3):
+        wait_until(lambda expected=generation + 1: len(self.processes) == expected and self.streamer.ready.is_set())
+        self.assertFalse(self.streamer._first_frame_written)
+        self.assertIsNone(self.streamer._first_frame_metrics['first_frame_write_ms'])
+        self.streamer.submit(bytes(stream.FRAME_BYTES))
+        wait_until(lambda: self.streamer.stats.snapshot()['frames_written'] == 1)
+        self.assertGreaterEqual(self.streamer._first_frame_metrics['first_frame_write_ms'], 120)
+        if generation == 0:
+          self.config.return_value = ScreenStreamConfig(bitrate=1000)
+        elif generation == 1:
+          self.network.return_value = ('wlan0', '192.168.1.9')
+      self.assertEqual(self.streamer._restart_count, 0)
+
+  def test_steady_20fps_write_accounting_and_observer_timestamps(self):
+    self.streamer._proc = Mock()
+    self.streamer._latency = observer = Mock()
+    self.streamer._process_started_at = 10.0
+    with patch.object(stream.os, 'write', return_value=stream.FRAME_BYTES):
+      for sequence in range(200):
+        captured = 10.0 + sequence * .05
+        started, completed = captured + .005, captured + .025
+        times = [started, started, completed, completed] if sequence == 0 else [started, started, completed]
+        with patch.object(stream.time, 'monotonic', side_effect=times):
+          self.streamer._write_frame(captured, bytes(stream.FRAME_BYTES), sequence, captured + .004)
+        observer.begin.assert_called_with(sequence, captured, captured + .004, started)
+        observer.complete.assert_called_with(sequence, completed, success=True)
+    result = self.streamer.stats.snapshot()
+    self.assertEqual(result['stdin_write_syscalls'], 200)
+    self.assertEqual(result['stdin_bytes'], 200 * stream.FRAME_BYTES)
+    self.assertEqual(result['stdin_blocked_events'], 0)
+    self.assertEqual(self.streamer._first_frame_metrics['first_frame_write_ms'], 20)
+    self.assertEqual(self.streamer._first_frame_metrics['process_start_to_first_frame_complete_ms'], 25)
+    self.assertEqual(stream.PIPE_WRITE_TIMEOUT, .1)
+    self.assertEqual(stream.FIRST_FRAME_WRITE_TIMEOUT, .5)
+
   def test_pipe_timeout_reports_age_elapsed_and_remaining_bytes(self):
     self.streamer._proc = Mock()
+    self.streamer._first_frame_written = True
     with patch.object(stream.time, 'monotonic', side_effect=[10.0, 10.0, 10.11]), \
          patch.object(stream.os, 'write', return_value=1):
       with self.assertRaises(stream.FrameWriteTimeout) as caught:

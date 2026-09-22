@@ -694,8 +694,8 @@ msgid "UDP Port"
 msgstr "UDP Port"
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
-msgid "UDP Screen Streaming"
-msgstr "UDP Screen Streaming"
+msgid "Screen Streaming"
+msgstr "Screen Streaming"
 
 #: openpilot/selfdrive/ui/layouts/settings/developer.py
 msgid "UI Debug Mode"

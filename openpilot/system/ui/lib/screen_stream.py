@@ -32,10 +32,12 @@ FRAME_MAX_AGE = 0.075
 PIPE_WRITE_TIMEOUT = 0.10
 TS_PACKET_SIZE = 188
 MULTICAST_TS_PACKETS_PER_DATAGRAM = 7
-UNICAST_TS_PACKETS_PER_DATAGRAM = 1
+UNICAST_TS_PACKETS_PER_DATAGRAM = 3
 UDP_PAYLOAD_SIZE = TS_PACKET_SIZE * MULTICAST_TS_PACKETS_PER_DATAGRAM
-SO_SNDBUF_REQUEST = 16 * 1024
+OUTQ_SAMPLE_INTERVAL = 0.1
 LATENCY_STATS_INTERVAL = 5.0
+UDP_CONGESTION_RATIO_PCT = 1.0
+UDP_CONGESTION_MIN_ATTEMPTS = 100
 ENCODER_PRESET = 'ultrafast'
 UDP_DROP_LOG_INTERVAL = 5.0
 TRANSIENT_SEND_ERRNOS = {
@@ -116,13 +118,16 @@ def ffmpeg_command(config: ScreenStreamConfig = DEFAULT_CONFIG) -> list[str]:
 
 class MpegTsUdpSender:
   """FFmpegのstdoutを専用スレッドで読み、TS境界を保ってWi-Fiへ送信する。"""
-  def __init__(self, stdout: BinaryIO, local_address: str, config: ScreenStreamConfig):
+  def __init__(self, stdout: BinaryIO, local_address: str, config: ScreenStreamConfig,
+               stdout_observer: Callable[[bytes], None] | None = None):
     self._stdout = stdout
+    self._stdout_observer = stdout_observer
     self._destination = (config.address, config.port)
     self.mode = 'multicast' if ipaddress.IPv4Address(config.address).is_multicast else 'unicast'
     self.payload_size = TS_PACKET_SIZE * (MULTICAST_TS_PACKETS_PER_DATAGRAM if self.mode == 'multicast' else UNICAST_TS_PACKETS_PER_DATAGRAM)
     self.socket_sndbuf = None
-    self.socket_outq_current = self.socket_outq_peak = None
+    self.socket_outq_current = self.socket_outq_peak = self.socket_outq_window_peak = None
+    self._next_outq_sample = 0.0
     self._outq_lock = threading.Lock()
     self._stop = threading.Event()
     self.done = threading.Event()
@@ -130,6 +135,9 @@ class MpegTsUdpSender:
     self.datagrams_sent = 0
     self.datagrams_dropped = 0
     self.bytes_sent = 0
+    self.stdout_bytes = self.stdout_chunks = 0
+    self._stats_previous = (0, 0, 0, 0, 0)
+    self._stats_started = time.monotonic()
     self._last_drop_log: float | None = None
     self._thread = threading.Thread(target=self._run, name="ui-screen-udp", daemon=True)
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -140,7 +148,6 @@ class MpegTsUdpSender:
       else:
         # ユニキャストも送信元をWi-Fiへ固定する。TTL設定はマルチキャストだけに適用する。
         self._socket.bind((local_address, 0))
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SO_SNDBUF_REQUEST)
       self.socket_sndbuf = self._socket.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
       self._socket.setblocking(False)
       os.set_blocking(stdout.fileno(), False)
@@ -184,6 +191,11 @@ class MpegTsUdpSender:
     # Linuxのsocketキューをサンプリングする。NIC・無線・受信側のキューは含まない。
     if not sys.platform.startswith('linux'):
       return
+    now = time.monotonic()
+    with self._outq_lock:
+      if now < self._next_outq_sample:
+        return
+      self._next_outq_sample = now + OUTQ_SAMPLE_INTERVAL
     try:
       import array
       import fcntl
@@ -193,9 +205,30 @@ class MpegTsUdpSender:
       with self._outq_lock:
         self.socket_outq_current = pending[0]
         self.socket_outq_peak = max(self.socket_outq_peak or 0, pending[0])
+        self.socket_outq_window_peak = max(self.socket_outq_window_peak or 0, pending[0])
     except (OSError, ValueError, TypeError, AttributeError, ImportError):
       with self._outq_lock:
         self.socket_outq_current = None
+
+  def stats_snapshot(self, now: float):
+    # 累積カウンターの差を取り、送信ループで毎packetの統計整形をしない。
+    current = (self.datagrams_sent, self.datagrams_dropped, self.bytes_sent, self.stdout_bytes, self.stdout_chunks)
+    sent, dropped, sent_bytes, stdout_bytes, stdout_chunks = (value - old for value, old in zip(current, self._stats_previous, strict=True))
+    elapsed = max(now - self._stats_started, 1e-6)
+    self._stats_previous, self._stats_started = current, now
+    with self._outq_lock:
+      outq = (self.socket_outq_current, self.socket_outq_peak, self.socket_outq_window_peak)
+      self.socket_outq_window_peak = None
+    return {
+      'sender_datagrams': current[0], 'sender_drops': current[1], 'sender_bytes': current[2],
+      'sender_drop_ratio_pct': round(100 * current[1] / max(current[0] + current[1], 1), 4),
+      'sender_datagrams_delta': sent, 'sender_drops_delta': dropped, 'sender_bytes_delta': sent_bytes,
+      'sender_drop_ratio_window_pct': round(100 * dropped / max(sent + dropped, 1), 4),
+      'stdout_bytes_delta': stdout_bytes, 'stdout_chunks_delta': stdout_chunks,
+      'stdout_bytes_per_sec': round(stdout_bytes / elapsed, 3), 'datagrams_per_sec': round(sent / elapsed, 3),
+      'sender_drops_per_sec': round(dropped / elapsed, 3), 'sender_bytes_per_sec': round(sent_bytes / elapsed, 3),
+      'socket_sndbuf': self.socket_sndbuf, 'socket_outq_current': outq[0], 'socket_outq_peak': outq[1], 'socket_outq_window_peak': outq[2],
+    }
 
   def _wait_readable(self):
     if os.name == 'posix':
@@ -219,10 +252,18 @@ class MpegTsUdpSender:
           if size and not self._stop.is_set():
             self._send_datagram(bytes(pending[:size]))
           return
+        # 診断時だけ観測時刻とbytesを保存する。通常配信にはPES解析を入れない。
+        if self._stdout_observer is not None:
+          self._stdout_observer(chunk)
         pending.extend(chunk)
-        while len(pending) >= self.payload_size and not self._stop.is_set():
-          self._send_datagram(bytes(pending[:self.payload_size]))
-          del pending[:self.payload_size]
+        self.stdout_bytes += len(chunk)
+        self.stdout_chunks += 1
+        offset = 0
+        while len(pending) - offset >= self.payload_size and not self._stop.is_set():
+          self._send_datagram(bytes(pending[offset:offset + self.payload_size]))
+          offset += self.payload_size
+        if offset:
+          del pending[:offset]
         self.sample_outq()
     except Exception as error:
       if not self._stop.is_set():
@@ -254,6 +295,8 @@ class ScreenStreamer:
                                         'ui-stream-network')
     self._config_monitor = CachedQuery(config, lambda value: CONFIG_INTERVAL, 'ui-stream-config')
     self._next_stats = 0.0
+    self._last_stats_time = 0.0
+    self._active_config: ScreenStreamConfig | None = None
 
   def start(self):
     self._thread.start()
@@ -277,21 +320,36 @@ class ScreenStreamer:
     if self._thread.is_alive():
       self._thread.join(timeout=2.0)
 
-  def _log_latency_stats(self, config):
+  def _log_latency_stats(self, config, final_reason: str | None = None):
     now = time.monotonic()
-    if self._proc is None or self._sender is None or now < self._next_stats:
+    if self._proc is None or self._sender is None or (final_reason is None and now < self._next_stats):
       return
     self._next_stats = now + LATENCY_STATS_INTERVAL
     sender = self._sender
     sender.sample_outq()
     values = self.stats.snapshot(reset=True)
-    values.update(pid=self._proc.pid, bitrate=config.bitrate, mode=sender.mode, sender_datagrams=sender.datagrams_sent,
-                  sender_drops=sender.datagrams_dropped, sender_bytes=sender.bytes_sent, socket_sndbuf=sender.socket_sndbuf,
-                  socket_outq_current=sender.socket_outq_current, socket_outq_peak=sender.socket_outq_peak)
-    cloudlog.info('screen stream latency stats: ' + ' '.join(f'{key}={value}' for key, value in values.items()))
+    elapsed = max(now - self._last_stats_time, 1e-6)
+    self._last_stats_time = now
+    values.update(stats_window_s=round(elapsed, 6), capture_fps=round(values['capture_count'] / elapsed, 3),
+                  submitted_fps=round(values['submitted_count'] / elapsed, 3), frames_written_fps=round(values['frames_written'] / elapsed, 3))
+    values.update(sender.stats_snapshot(now))
+    values.update(pid=self._proc.pid, bitrate=config.bitrate, mode=sender.mode)
+    prefix = 'screen stream latency stats: ' if final_reason is None else f'screen stream latency final: reason={final_reason!r} '
+    cloudlog.info(prefix + ' '.join(f'{key}={value}' for key, value in values.items()))
+    if (values['sender_datagrams_delta'] + values['sender_drops_delta'] >= UDP_CONGESTION_MIN_ATTEMPTS
+        and values['sender_drop_ratio_window_pct'] >= UDP_CONGESTION_RATIO_PCT):
+      cloudlog.warning(f"screen stream UDP congestion: pid={self._proc.pid} bitrate={config.bitrate} mode={sender.mode} " +
+                       f"window_s={elapsed:.3f} sent={values['sender_datagrams_delta']} dropped={values['sender_drops_delta']} " +
+                       f"drop_ratio_pct={values['sender_drop_ratio_window_pct']}")
 
   def _close_process(self, reason: str = "shutdown"):
     self.ready.clear()
+    if self._active_config is not None:
+      try:
+        self._log_latency_stats(self._active_config, final_reason=reason)
+      except Exception:
+        cloudlog.exception('screen stream latency final failed')
+      self._active_config = None
     proc, self._proc = self._proc, None
     sender, self._sender = self._sender, None
     if sender is not None:
@@ -469,11 +527,13 @@ class ScreenStreamer:
             except OSError as error:
               raise SenderFatalError(f"sender fatal error during setup: errno={error.errno} error={error!r}") from error
             self._sender.start()
+            self._active_config = current_config
             cloudlog.info(f"screen stream started: pid={self._proc.pid} mode={self._sender.mode} network={current_network!r} " +
                           f"destination={current_config.address}:{current_config.port} bitrate={current_config.bitrate} ttl={current_config.ttl} " +
                           f"socket_sndbuf={self._sender.socket_sndbuf} payload_size={self._sender.payload_size} preset={ENCODER_PRESET}")
             self.stats.snapshot(reset=True)
-            self._next_stats = time.monotonic() + LATENCY_STATS_INTERVAL
+            self._last_stats_time = time.monotonic()
+            self._next_stats = self._last_stats_time + LATENCY_STATS_INTERVAL
             self.ready.set()
           self._log_latency_stats(current_config)
           try:

@@ -20,7 +20,7 @@ Development stays on `udp-screen-streaming`. Future upstream PRs target master; 
 1. 配信パラメーターを含むソースをビルドし、commaとPCを同じWi-Fiへ接続します。 / Build the source with streaming parameter keys and connect comma and the PC to the same Wi-Fi.
 2. Settings → Toggles → “UDP Screen Streaming”（日本語: UDP画面配信）をONにします。既定はOFFです。 / Enable “UDP Screen Streaming” in Settings → Toggles. It is off by default.
 3. “Destination Address”（送信先アドレス）にPCのWi-Fi IPv4（例: `192.168.4.44`）、ポートに`12346`を指定します。設定変更は自動反映されます。 / Set Destination Address to the PC's Wi-Fi IPv4 (e.g. `192.168.4.44`) and port to `12346`. Saved changes apply automatically.
-4. 以下の受信コマンドを1つだけ起動します。まず500 kbit/sで試し、1500 kbit/sで統計と遅延を比較します。 / Start one receiver below. Test at 500 kbit/s first, then compare statistics and latency at 1500 kbit/s.
+4. 以下の受信コマンドを1つだけ起動します。500／1000／1500 kbit/sでそれぞれ15～30秒以上配信し、統計と遅延を比較します。 / Start one receiver below. Stream for at least 15–30 seconds each at 500/1000/1500 kbit/s and compare statistics and latency.
 
 | 設定 / Setting | 許容値 / Allowed values | 既定値 / Default |
 | --- | --- | --- |
@@ -64,12 +64,12 @@ Do not use `-avioflags direct`: device testing with Windows FFplay reported “P
 GStreamerを導入済みの場合の低遅延unicast候補（PowerShell用1行） / Low-latency unicast candidate for an installed GStreamer environment (one line for PowerShell):
 
 ```powershell
-gst-launch-1.0 -v udpsrc address=0.0.0.0 port=12346 buffer-size=65536 caps="video/mpegts,systemstream=(boolean)true,packetsize=(int)188" "!" tsdemux latency=0 "!" h264parse "!" avdec_h264 "!" queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "!" videoconvert "!" autovideosink sync=false async=false
+gst-launch-1.0 -v udpsrc address=0.0.0.0 port=12346 buffer-size=65536 caps="video/mpegts,systemstream=(boolean)true,packetsize=(int)188" "!" tsdemux latency=0 "!" h264parse "!" avdec_h264 "!" queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "!" videoconvert "!" autovideosink sync=false
 ```
 
-PowerShellで改行する場合は行末にバッククォートを使用し、cmd用の`^`は使いません。GStreamerコマンドの実機動作・遅延は未確認です。必要なプラグインと比較手順は[手順書](docs/ui_udp_stream.md#受信と切り分け)を参照してください。
+PowerShellで改行する場合は行末にバッククォートを使用し、cmd用の`^`は使いません。Windows実機ではautovideosinkのasyncプロパティが使えないため指定しません。上記構成で受信できましたが、遅延はFFplayと大差なかったとの報告です。必要なプラグインと比較手順は[手順書](docs/ui_udp_stream.md#受信と切り分け)を参照してください。
 
-For multiline PowerShell commands, use a trailing backtick, not cmd's `^`. Device operation and latency of this GStreamer command remain unverified. See the [guide (Japanese)](docs/ui_udp_stream.md#受信と切り分け) for required plugins and comparisons.
+For multiline PowerShell commands, use a trailing backtick, not cmd's `^`. Omit the unsupported autovideosink async property on the tested Windows installation. Device testing confirmed reception with this pipeline, with latency similar to FFplay. See the [guide (Japanese)](docs/ui_udp_stream.md#受信と切り分け) for required plugins and comparisons.
 
 ## 実験版の変更 / Experimental changes
 
@@ -81,18 +81,18 @@ For multiline PowerShell commands, use a trailing backtick, not cmd's `^`. Devic
 | VBV | bitrate / 10（1500 kbit/sなら150 kbit）/ 150 kbit at 1500 kbit/s |
 | 古い未送信frame / Stale pending frames | 75ms以上で破棄 / discard at 75 ms |
 | stdin書き込み期限 / Write deadline | 書き込み開始から100ms / 100 ms from write start |
-| Unicast | 188 bytes/datagram、SO_SNDBUF要求16 KiB / requested SO_SNDBUF 16 KiB |
+| Unicast | 564 bytes/datagram（TS 3個）、SO_SNDBUFはOS既定値 / 3 TS packets, OS-default SO_SNDBUF |
 | Multicast | 従来どおり1316 bytes集約とTTL / existing 1316-byte coalescing and TTL |
 | 監視 / Monitoring | D-Bus・設定を別スレッドで照会 / separate D-Bus and configuration polling threads |
-| 統計 / Statistics | cloudlogへ約5秒ごと / cloudlog approximately every 5 seconds |
+| 統計 / Statistics | 約5秒ごとの区間値・drop率・stdout量・outqと終了前のfinalログ / window rates, drops, stdout throughput, outq approximately every 5 seconds, plus final statistics before closing |
 
 RGBA → FFmpeg stdin → libx264 / MPEG-TS → stdout (`pipe:1`) → Python socketの経路を維持します。送信側FFmpegは`file`・`pipe`対応だけで動作し、UDPプロトコルを必要としません。Linuxではstdoutのread可能通知で送信を再開し、固定bitrate pacingは加えません。SCHED_OTHERを維持し、意図的なnice +10設定を廃止します。GPU readbackは同期方式のままです。
 
 The path remains RGBA → FFmpeg stdin → libx264 / MPEG-TS → stdout (`pipe:1`) → Python socket. Sender FFmpeg needs only `file` and `pipe`, not UDP protocol support. Linux waits for stdout readability without fixed-bitrate pacing. The worker stays on SCHED_OTHER and no longer sets nice +10. GPU readback remains synchronous.
 
-75msと100msは個別の処理上限で、合計100ms以下を保証しません。VBV値も実際の待ち時間を表すものではありません。短い期限による再起動、小さい送信バッファでの破棄、188-byte送信のCPU・無線負荷を統計で確認してください。
+75msと100msは個別の処理上限で、合計100ms以下を保証しません。VBV値も実際の待ち時間を表すものではありません。1500 kbit/sの単純換算では188→564 bytesで約997→332 datagrams/sとなります。SO_SNDBUF実値を記録し、Linux outqの取得を100ms間隔に制限します。区間の送信試行が100件以上かつdrop率1%以上なら混雑警告を出し、警告だけではエンコーダを再起動しません。
 
-The 75 ms and 100 ms limits apply to separate stages and do not guarantee a total below 100 ms. VBV size is not a measured buffering delay. Check statistics for restarts from shorter deadlines, drops from the smaller send buffer, and CPU/Wi-Fi overhead from 188-byte datagrams.
+The 75 ms and 100 ms limits apply to separate stages and do not guarantee a total below 100 ms. VBV size is not a measured buffering delay. At 1500 kbit/s, a payload-only estimate falls from about 997 to 332 datagrams/s when moving from 188 to 564 bytes. Actual SO_SNDBUF is logged, and Linux outq sampling is limited to once per 100 ms. A window with at least 100 send attempts and 1% drops produces a congestion warning without restarting the encoder solely for that warning.
 
 録画`RECORD=1`を優先し、Wi-Fi未接続・消灯時は停止します。OFF時はキャプチャ・送信と定期照会を休止します。配信は暗号化・認証されず、設定画面も含まれます。音声と描画後のデバッグ表示は含まれません。
 
@@ -100,18 +100,19 @@ The 75 ms and 100 ms limits apply to separate stages and do not guarantee a tota
 
 ## 検証・実機診断 / Validation and device diagnostics
 
-実機`40e0a4961`ではunicastで画質が大幅に改善し、PIDも安定したとの報告があります。ただし数百ms～約1000msの遅延が残り、1500 kbit/sの方が500より遅いと報告されています。両条件のqdisc backlog・drop等は0でした。今回の実験版による実機改善は未測定です。
+実機`fe6f5b329`では500 kbit/sで約800ms、1500で約1300msの遅延が報告されました。SO_SNDBUF実値32768に対しoutq peakは33280、EAGAINによる大量dropが発生した一方、qdisc backlog・drop等は0でした。今回は188-byte送信と16 KiBの送信バッファ指定を見直します。この変更後の実機改善は未測定です。
 
-Device reports for `40e0a4961` confirm substantially better unicast quality and a stable PID, but hundreds of milliseconds to roughly 1 second of latency remain, with 1500 kbit/s slower than 500. Reported qdisc backlog and drop counters were zero at both rates. Device improvements from this experimental version remain unmeasured.
+Device reports for `fe6f5b329` show roughly 800 ms at 500 kbit/s and 1300 ms at 1500. Actual SO_SNDBUF was 32768 with an outq peak of 33280 and substantial EAGAIN drops, while qdisc backlog and drop counters were zero. This revision replaces 188-byte datagrams and the forced 16 KiB send buffer. Device improvements after this change remain unmeasured.
 
-開発PCでは不規則入力のPTS圧縮を再現し、wall-clock入力でgapが保たれることを500／1500／3000 kbit/sで確認しました。[検証結果・ベンチマーク・実機手順](docs/ui_udp_stream.md)を参照してください。
+不規則入力のwall-clock PTSテストを維持し、500／1000／1500／3000 kbit/sのフレーム診断を追加しました。合成画像の識別子・復号PTS・PESを照合し、各frameのstdin完了→stdout初観測を測ります。解析は計測後に実施し、通常のUI配信には入れません。診断はパイプのみ、または本番Python UDP sender経由で比較できます。[検証結果・ベンチマーク・実機手順](docs/ui_udp_stream.md)を参照してください。
 
-Development-PC tests reproduced compressed PTS gaps and verified that wall-clock input preserves them at 500/1500/3000 kbit/s. See the [validation results, benchmark, and device guide (Japanese)](docs/ui_udp_stream.md).
+Wall-clock PTS tests remain in place. New frame diagnostics at 500/1000/1500/3000 kbit/s match synthetic image IDs, decoded PTS, and PES records to measure each frame from stdin completion to first stdout observation. Parsing runs after measurement and is absent from normal UI streaming. Compare pipe-only diagnostics with the production Python UDP sender path. See the [validation results, benchmark, and device guide (Japanese)](docs/ui_udp_stream.md).
 
 実機で最初に見る統計とハードウェアエンコーダの診断（自動採用はしません） / First device statistics to inspect and hardware-encoder discovery (no automatic selection):
 
 ```sh
-grep -R -a "screen stream latency stats" /data/log 2>/dev/null | tail -30
+HASH=$(git rev-parse HEAD)
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream latency stats:" | grep "bitrate=500 " | tail -10
 ffmpeg -hide_banner -encoders 2>/dev/null | grep -Ei 'h264|v4l2|qcom|omx|vaapi'
 ```
 

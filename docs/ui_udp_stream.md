@@ -4,15 +4,26 @@
 
 comma 3X → Windows PCのunicastを基本候補とし、glass-to-glass 100ms以下を目標に計測と調整を行う実験版。100ms達成を保証するものではなく、本変更後の実機遅延は未測定。MIB・MOST・AIDは変更しない。H.264 / MPEG-TS / UDPを維持し、multicastも残す。
 
-利用者による`40e0a4961`の実機報告:
+利用者による`fe6f5b32953171882c9bd13968998a4b0d906887`の実機報告:
 
 - comma `192.168.4.38` → PC `192.168.4.44:12346` のunicastで画質が大幅改善。従来のmulticastではPacket corrupt・H.264 macroblockエラーが多かった。
-- FFmpeg PIDは安定。以前のsender集計は`sent=21536 dropped=0`。
-- 遅延は数百ms～約1000ms。1500 kbit/sは500 kbit/sより遅い。
+- FFmpeg PIDの安定化とunicastの画質改善を維持する。
+- glass-to-glassは500 kbit/sで約800ms、1500 kbit/sで約1300ms。
+- `socket_sndbuf=32768`に対し`socket_outq_peak=33280`。16 KiB要求による小さいsocket容量をほぼ使い切り、`last_errno=11`（EAGAIN系）の大量dropが発生した。
+- 1000 kbit/sは成功約75,000／破棄約6,800（試行数に対して約8.3%）、1500は成功約65,000／破棄約10,600（約14.0%）。概数・別セッションのため正確な比較には同じ長さのwindowが必要。
 - 両ビットレートでqdiscのdropped / overlimits / requeues / backlogは0。
 - Windows FFplayの`-avioflags direct`で “Part of datagram lost due to insufficient buffer size” と映像破損が多発。このオプションは推奨から除外する。
 
-qdiscやPythonの破棄数が0でも、エンコーダ・socket・無線ドライバー・受信側に待ちがないとは断定しない。
+500／1500の`tc -s qdisc show dev wlan0`はdropped 0 / overlimits 0 / requeues 0 / backlog 0b 0pだった。qdiscは主要な滞留箇所には見えないが、socket outqには混雑が観測されている。両者は異なる段階の計測であり、qdiscが0でもsocket・無線ドライバー・受信側の待ちを否定できない。outqとSO_SNDBUFも単純な映像payload容量として換算しない。
+
+| 実機の区間平均 | 1000 kbit/s付近 | 1500 kbit/sの悪化区間 |
+| --- | --- | --- |
+| capture | 約3.5～4ms | 概ね3～4ms |
+| queue_age | 約5～8ms | 約29～34ms |
+| stdin_write | 約16～24ms | 約47～51ms |
+| frame_age_written | 約22～32ms | 約76～85ms、最大110～138ms |
+
+GPU readbackは約2.5～3msで、現状の800～1300msの主因には見えない。高bitrate → stdout量増加 → UDP送信負荷／socket混雑 → stdoutの読み出し停滞 → FFmpeg内部／stdinの詰まり → queue age増加という仮説を検証する。非ブロッキングsendto自体は混雑時に待たず破棄するので、この因果関係を既に証明したとは扱わない。
 
 ## ブランチと導入
 
@@ -32,7 +43,7 @@ ffmpeg -hide_banner -muxers 2>/dev/null | grep mpegts
 
 必要なのはlibx264、MPEG-TS、file/pipe。comma標準FFmpegのUDP非対応でもPython socketで送信する。hardware H.264 encoderは実機のcapability確認後に判断し、自動選択しない。Windowsの`.venv`は端末へコピーしない。
 
-設定 → トグル → UDP Screen Streaming（日本語: UDP画面配信）をONにする。Destination AddressをPCのWi-Fi IPv4、ポート12346、最初は500 kbit/sに設定。受信できたら1500へ変更して同じ試験を行う。保存直後のsenderとFFmpegの再生成は正常であり、試験途中の障害再起動と区別する。
+設定 → トグル → UDP Screen Streaming（日本語: UDP画面配信）をONにする。Destination AddressをPCのWi-Fi IPv4、ポート12346、最初は500 kbit/sに設定。1000、1500へ変更して各15～30秒以上配信し、5秒statsを複数採取する。保存直後のsenderとFFmpegの再生成は正常であり、試験途中の障害再起動と区別する。
 
 ## 設定と互換性
 
@@ -59,7 +70,9 @@ wallclockのみ、wallclock＋fps_mode passthrough、さらにcopyts / start_at_
 
 ## エンコードと期限
 
-| 項目 | 従来 | 今回 |
+以下は`fe6f5b329`で導入済みで、今回も維持する。
+
+| 項目 | 導入前 | 維持する値 |
 | --- | --- | --- |
 | 入力PTS | 受信フレーム数 / 20 | 入力wallclock |
 | x264 preset | veryfast | ultrafast |
@@ -71,7 +84,7 @@ wallclockのみ、wallclock＋fps_mode passthrough、さらにcopyts / start_at_
 
 維持: 800×480、最大20fps、libx264、zerolatency、baseline、yuv420p、B=0、GOP=10、keyint_min=10、sc_threshold=0、threads=2、muxdelay=0、muxpreload=0、flush_packets=1、MPEG-TSのpipe:1出力。500 / 1500 / 3000 kbit/sのVBVは50 / 150 / 300 kbitで、開発PCのlibx264ではエラーや最小値へのclamp警告は出なかった。VBVはrate-controlの容量であり、その値を実際の100ms待機と解釈しない。
 
-75ms以上古い未送信frameは、FFmpegへ入れる前に丸ごと破棄する。rawvideoを途中まで書いた後に100msの期限へ達した場合は、境界を壊さないようFFmpegごと再生成する。2つの上限は独立し、合計100ms以下を保証しない。以前の実機では最大114.2msのstdin書き込み報告もあるため、今回の厳しい期限で再起動が増えないか確認する。
+75ms以上古い未送信frameは、FFmpegへ入れる前に丸ごと破棄する。rawvideoを途中まで書いた後に100msの期限へ達した場合は、境界を壊さないようFFmpegごと再生成する。2つの上限は独立し、合計100ms以下を保証しない。今回captured + 100msの絶対期限は追加しない。まず送信負荷と混雑を改善し、frame ageと再起動頻度を取り直す。
 
 配信ワーカーでSCHED_OTHERへ変更してからmonitor・sender・FFmpegを起動する。意図的なnice +10を廃止し、nice 0への昇格操作も行わない。親プロセスのniceを継承するため、通常priorityで起動していることは実機で確認する。CAP_SYS_NICEを必要とするpriority上昇やrealtime化は行わない。
 
@@ -83,20 +96,29 @@ wallclockのみ、wallclock＋fps_mode passthrough、さらにcopyts / start_at_
 | --- | --- | --- |
 | 送信元 | bind((Wi-Fi IPv4, 0)) | IP_MULTICAST_IF=Wi-Fi IPv4 |
 | TTL | OS既定値、UI設定は無視 | IP_MULTICAST_TTL=保存値 |
-| 通常UDP payload | 188 bytes（TS 1個） | 1316 bytes（TS 7個） |
-| SO_SNDBUF要求 | 16 KiB | 明示変更なし |
+| 通常UDP payload | 564 bytes（TS 3個） | 1316 bytes（TS 7個） |
+| SO_SNDBUF要求 | 明示変更なし、OS既定値 | 明示変更なし、OS既定値 |
 
-読み取り境界とTS境界が異なっても順序どおり保持する。unicastはTS 1個が揃えば送信し、multicastは従来どおり7個へ集約する。正常EOFだけ残った完全なTSを送信し、停止時の末尾や不完全なTSは破棄する。TS途中で任意に間引く処理は追加しない。一時的なEAGAIN / ENOBUFS等ではデータグラムだけを破棄してFFmpegを維持し、致命的障害は再生成する。
+読み取り境界とTS境界が異なっても順序どおり保持する。unicastはTS 3個、multicastは7個へ集約する。各sendtoへ独立したbytesを渡し、offsetを進め、バッチ最後にbytearray先頭を1回だけ削除する。正常EOFだけ残った完全なTSを送信し、停止時の末尾や不完全なTSは破棄する。一時的なEAGAIN / ENOBUFS等ではデータグラムだけを破棄してFFmpegを維持し、致命的障害は再生成する。
+
+TSの欠落はH.264の破損につながるため、大量dropを正常と扱わない。約5秒の区間で送信試行100件以上かつdrop率1%以上なら`screen stream UDP congestion:`を出す。終了前の短い区間にも同じ基準を適用する。警告だけで再起動せず、既存の`screen stream UDP drops:`（最大約5秒に1回）も残す。
 
 Linuxでは非ブロッキングstdoutのEAGAIN後にselectで可読通知を待つ。50msは停止確認のための最大待機で、データ到着時は即時に起きる。Windowsの匿名パイプはselect非対応なので、開発PCでは1ms待機を使う。
 
-SO_SNDBUFはgetsockoptで実値を読み、起動・統計ログへ出す。Linuxでは要求値の倍などになる場合があるため、要求16 KiBを実値と混同しない。[socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html)
+強制SO_SNDBUF=16 KiBを撤廃し、getsockoptでOS既定の実値を読み、起動・統計ログへ出す。変更後のcomma実値は未測定。容量を戻すことでdropの改善を狙うが、bufferが大きいほど遅延が小さいとは限らないのでoutq・frame age・端末間遅延を併せて確認する。[socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html)
 
-LinuxのTIOCOUTQでsocketのpending output bytesを、stdout読み取りバッチの送信後と統計出力時にサンプリングする。取得失敗は配信障害にせずcurrent=Noneとする。peakはsender生成以降のサンプル最大値で、未観測の瞬間ピークや無線ドライバー・AP・受信側のキューは含まない。[udp(7)](https://man7.org/linux/man-pages/man7/udp.7.html)
+LinuxのTIOCOUTQはstdout読み取りバッチの送信後と統計出力時に呼び出し機会を持つが、共通の100ms制限によりioctlは最大約10回/秒に抑える。packetごとには取得しない。アイドル時の厳密な100ms周期は保証しない。取得失敗は配信障害にせずcurrent=Noneとする。peakはsender生成以降、window_peakは前回統計以降のサンプル最大値で、統計出力時にwindowだけリセットする。サンプルがなければNone。未観測の瞬間ピークや無線ドライバー・AP・受信側のキューは含まない。[udp(7)](https://man7.org/linux/man-pages/man7/udp.7.html)
 
-1500 kbit/sを188-byte payloadだけで換算すると約997 datagrams/s（TS・ネットワークの追加分は別）となり、1316-byte方式の約7倍。CPU負荷と無線効率は実機確認が必要。破棄が増えた場合はSO_SNDBUF_REQUESTを32 KiB、またはUNICAST_TS_PACKETS_PER_DATAGRAMを2（376 bytes）として、変更を1項目ずつ比較できる。
+| TS個数 | payload bytes | 1500 kbit/sのdatagrams・sendto回数/秒（概算） | 211 TSを送るテストでの回数 |
+| --- | --- | --- | --- |
+| 1 | 188 | 997 | 211 |
+| 2 | 376 | 499 | 106 |
+| 3（既定） | 564 | 332 | 71 |
+| 7 | 1316 | 142 | 31 |
 
-調整用定数は`openpilot/system/ui/lib/screen_stream.py`先頭にまとめる: FRAME_MAX_AGE、PIPE_WRITE_TIMEOUT、UNICAST_TS_PACKETS_PER_DATAGRAM、MULTICAST_TS_PACKETS_PER_DATAGRAM、SO_SNDBUF_REQUEST、LATENCY_STATS_INTERVAL、ENCODER_PRESET。環境変数による暗黙のoverrideは追加しない。
+概算はbitrate / (8 × payload)、ネットワーク等のoverheadは別。各datagramでsendtoを1回行う。564 bytes分の連続入力時間は1500 kbit/sで約3ms、500で約9msとなり、送信回数と集約待ちの折衷とする。実際の映像出力はVBR・バーストなので、この値は待ち時間の上限ではない。ベンチマークは実際のTS長から全4候補の送信回数も計算する。
+
+実機A/Bは`openpilot/system/ui/lib/screen_stream.py`のUNICAST_TS_PACKETS_PER_DATAGRAMだけを1／2／3／7へ変更し、他条件を固定する。追加UIは設けない。FRAME_MAX_AGE、PIPE_WRITE_TIMEOUT、OUTQ_SAMPLE_INTERVAL、LATENCY_STATS_INTERVAL、UDP_CONGESTION_RATIO_PCT、UDP_CONGESTION_MIN_ATTEMPTS、ENCODER_PRESETも先頭へまとめる。環境変数による暗黙のoverrideは追加しない。
 
 ## 監視とキャプチャ
 
@@ -106,21 +128,27 @@ LinuxのTIOCOUTQでsocketのpending output bytesを、stdout読み取りバッ�
 
 `ScreenStreamCapture.capture()`はGPU操作前のmonotonic時刻を記録し、submit(data, captured=...)へ渡す。GPU縮小、同期load_image_from_texture、bytesコピーを区別して計測する。queue_ageはキャプチャ開始から取り出しまでなのでreadback時間も含む。frame_age_writtenはstdinへの全書き込み完了までを含む。
 
-GPU readback remains synchronous。PBOは未実装。現行pyrayのload_image_from_texture / rl_read_texture_pixels経路と描画ループを確認したが、PBO専用APIとfence・複数フレームのリソース管理を新規に持ち込まず、まず計測を優先する。GPU描画命令の非同期実行による待ちはreadback側の時間へ現れることがある。
+GPU readbackは同期方式を維持し、今回この経路を変更しない。実機でcapture約3～4ms、readback約2.5～3msなので、PBO・zero-copyは追加せず計測を維持する。GPU描画命令の非同期実行による待ちはreadback側の時間へ現れることがある。
 
 キャプチャ位置は`application.py`のend_drawing後を維持する。RenderTextureはend_texture_mode直後に完成するが、そこへ同期readbackを移すとローカル画面表示を遅らせる可能性がある。効果を実機で確認できないため移動せず、描画途中のtextureは読まない。描画完了からキャプチャ開始までの表示待ち時間は今回のcapture統計には含まない。
 
 ## 実機での再起動診断と遅延統計
 
 ```sh
-grep -R -a "screen stream latency stats" /data/log 2>/dev/null | tail -30
-grep -R -a "screen stream UDP drops" /data/log 2>/dev/null | tail -30
-grep -R -a "screen stream restart" /data/log 2>/dev/null | tail -30
-grep -R -a "screen stream started" /data/log 2>/dev/null | tail -10
+HASH=$(git rev-parse HEAD)
+for BITRATE in 500 1000 1500; do
+  grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null \
+    | grep "screen stream latency stats:" | grep "bitrate=$BITRATE " | tail -10
+done
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream UDP drops" | tail -30
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream UDP congestion:" | tail -30
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream latency final:" | tail -30
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep -E "screen stream (restart|started)" | tail -30
 pgrep -a -x ffmpeg
+tc -s qdisc show dev wlan0
 ```
 
-起動ログ: PID、mode、Wi-Fi tuple、destination、bitrate、TTL、socket_sndbuf実値、payload_size、preset。statsは配信ワーカーから約5秒ごとにcloudlogへ出し、毎frameのログは行わない。OFF・消灯・待機中は定期ログを出さない。
+実機の作業ツリーがクリーンで、新コミットから起動済みであることを先に確認する。過去コミットの集計を混ぜない。起動ログ: PID、mode、Wi-Fi tuple、destination、bitrate、TTL、socket_sndbuf実値、payload_size、preset。statsは配信ワーカーから約5秒ごとにcloudlogへ出し、毎frameのログは行わない。OFF・消灯・待機中は定期ログを出さない。
 
 | 統計 | 意味 |
 | --- | --- |
@@ -137,13 +165,21 @@ pgrep -a -x ffmpeg
 | stdin_write_avg_ms / max_ms | 書き込み開始から完了または失敗まで |
 | frame_age_written_avg_ms / max_ms | キャプチャ開始から完全書き込み終了まで |
 | sender_datagrams / sender_drops / sender_bytes | senderの累積送信成功数・破棄数・成功bytes |
+| sender_drop_ratio_pct | 累積drop /（成功 + drop）×100 |
+| sender_datagrams_delta / sender_drops_delta / sender_bytes_delta | 前回統計以降の成功数・破棄数・成功bytes |
+| sender_drop_ratio_window_pct | 区間drop /（区間成功 + 区間drop）×100。試行0なら0 |
+| stdout_bytes_delta / stdout_chunks_delta / stdout_bytes_per_sec | FFmpeg stdoutから読み取れたbytes・read回数・bytes/秒 |
+| datagrams_per_sec / sender_drops_per_sec / sender_bytes_per_sec | 区間の成功datagrams/秒・破棄/秒・成功bytes/秒 |
+| stats_window_s / capture_fps / submitted_fps / frames_written_fps | 実際の区間秒数とcapture・submit・完全stdin書き込みの各回数/秒 |
 | socket_sndbuf | getsockoptで取得した実容量 |
-| socket_outq_current / peak | 最新サンプル／sender生成後のサンプル最大値。未対応・取得失敗はNone |
+| socket_outq_current / socket_outq_peak / socket_outq_window_peak | 最新サンプル／sender生成後の最大／前回stats以降の最大。未観測はNone |
 | pid / bitrate / mode | 現在のエンコーダと送信設定 |
 
-capture～frames_writtenと時間統計は前回ログからの区間値で、各時間の平均はその測定サンプル数を分母にする。sender統計はsender生成からの累積値なので、同じPIDの連続ログの差分で比較する。エンコーダ再生成で区間統計とsender累積値はリセットされる。処理段階の境界をまたぐframeがあるため、同一区間の各countが必ず一致するわけではない。終了・再生成直前の5秒未満の区間統計はログに残らない場合がある。
+capture～frames_writtenと時間統計は前回ログからの区間値で、各時間の平均はその測定サンプル数を分母にする。rateは固定の5秒ではなく実経過時間で割る。senderの累積値と区間差分を両方残す。送信と統計のスレッドは並行するため、カウンターの採取境界や処理段階をまたぐframeによって同一区間の数は完全には一致しない。
 
-500→1500でqueue_replaced増加・frames_written減少・stdin_write増加が同時に見えれば入力処理能力不足を疑う。capture/readbackが継続して10～20msを超えるならGPU同期の改善を検討する。outqが増えるならsocketより下流も調べ、sender_drops増加時は送信バッファ制限と小さいpacketの影響を比較する。これらが小さくてもPC表示が遅ければ、受信demux・decode・表示同期を調べる。
+終了・設定変更・再起動ではencoder/senderを閉じる前に`screen stream latency final: reason=...`を1回出し、5秒未満の区間も保存する。停止済みの状態でcloseを繰り返しても重複しない。採取後から送信スレッド停止までのごく短い差はあり得る。新しいencoderで区間統計とsender累積値をリセットする。ログ採取の例外が起きても停止処理は続ける。
+
+500→1000→1500でstdout量・drop率・outq・stdin_write・queue_ageが同じ区間で増えるか確認する。stdout_bytes_per_secは「既に読み取れた量」であって未読キュー容量ではない。低い値だけでエンコーダが遅いと断定しない。queue_replaced増加、frames_written_fps低下、stdin_write悪化も合わせて見る。後述のパイプ単独とUDP経由のフレーム診断で差が出れば、送信処理からの逆圧の仮説を補強できる。
 
 ## 受信と切り分け
 
@@ -163,14 +199,16 @@ multicast比較時は本体の送信先を239.255.42.99へ変更し、PCのURL�
 GStreamer（必要なudpsrc・tsdemux・h264parse・avdec_h264・queue・videoconvert・autovideosinkを導入済みの場合）:
 
 ```powershell
-gst-launch-1.0 -v udpsrc address=0.0.0.0 port=12346 buffer-size=65536 caps="video/mpegts,systemstream=(boolean)true,packetsize=(int)188" "!" tsdemux latency=0 "!" h264parse "!" avdec_h264 "!" queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "!" videoconvert "!" autovideosink sync=false async=false
+gst-launch-1.0 -v udpsrc address=0.0.0.0 port=12346 buffer-size=65536 caps="video/mpegts,systemstream=(boolean)true,packetsize=(int)188" "!" tsdemux latency=0 "!" h264parse "!" avdec_h264 "!" queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "!" videoconvert "!" autovideosink sync=false
 ```
 
-[tsdemux](https://gstreamer.freedesktop.org/documentation/mpegtsdemux/tsdemux.html)のlatency既定値は700msのため0を明示する。[queue](https://gstreamer.freedesktop.org/documentation/coreelements/queue.html)は復号後に置き、古い復号済みframeを落とす。圧縮H.264やTSの途中をqueueで間引かない。udpsrcの64 KiBは受信バッファ要求値で、実機のlossと併せて確認する。sync=falseは時計待ちを避けるが、どのreceiverでも100ms達成を保証しない。開発環境ではGStreamerと実機画面表示を実行していない。
+[tsdemux](https://gstreamer.freedesktop.org/documentation/mpegtsdemux/tsdemux.html)のlatency既定値は700msのため0を明示する。[queue](https://gstreamer.freedesktop.org/documentation/coreelements/queue.html)は復号後に置き、古い復号済みframeを落とす。圧縮H.264やTSの途中をqueueで間引かない。udpsrcの64 KiBは受信バッファ要求値で、実機のlossと併せて確認する。sync=falseは時計待ちを避けるが、どのreceiverでも100ms達成を保証しない。
+
+利用者のWindows環境でautovideosinkのasyncプロパティ指定は`no property "async"`で失敗したため削除した。上記のtsdemux latency=0・復号後最新1frame・sync=false構成は実機受信でき、glass-to-glassはFFplayと大差なかった。FFplay固有bufferingだけを800～1300msの主因とは見なしにくい。共通の受信・復号・表示待ちまで否定した結果ではない。
 
 ## 実機A/Bと遅延測定
 
-同じAP、機器位置、UI操作、PC電源設定、画面リフレッシュレートを固定する。各条件で10秒ウォームアップ後に5分間測定し、3回以上繰り返す。まず500、次に1500 kbit/sを比較する。通常の設定変更時だけPIDが変わり、測定中は安定していることを確認する。
+同じAP、機器位置、UI操作、PC電源設定、画面リフレッシュレートを固定する。まず500／1000／1500 kbit/sの各条件を15～30秒以上配信し、5秒statsを複数採る。PID・drop・遅延が安定したら10秒ウォームアップ後に5分測定し3回以上繰り返す。通常の設定変更時だけPIDが変わり、測定中は安定していることを確認する。
 
 1. unicast＋通常FFplay。
 2. 同じunicast＋低遅延FFplay。細分化するならprobesize / analyzedurationを固定した基準へmax_delay、次にnobuffer / low_delay / framedropを加える。directは試験項目から除外する。
@@ -188,14 +226,29 @@ gst-launch-1.0 -v udpsrc address=0.0.0.0 port=12346 buffer-size=65536 caps="vide
 
 comma画面とPC画面を同時にスマートフォンの60fps以上で撮影し、同一UI変化のframe差を測る。`遅延ms = frame差 / 撮影fps × 1000`。60fpsで6frameなら100ms。可変fps動画では時刻を使用する。各条件10サンプル以上を採り、中央値・最大値・標本数・撮影fpsを記録する。60fpsの1frameは約16.7msなので、小さい差を過大評価しない。初回映像が出るまでの時間は定常時遅延と分ける。
 
-| 条件 | 遅延中央値／最大ms | Packet corrupt / H.264エラー | queue replaced / written | readback / stdin最大ms | outq peak / drops | PID安定 |
-| --- | --- | --- | --- | --- | --- | --- |
-| Unicast 500 / FFplay通常 | 未測定 | 未測定 | 未測定 | 未測定 | 未測定 | 未確認 |
-| Unicast 1500 / FFplay通常 | 未測定 | 未測定 | 未測定 | 未測定 | 未測定 | 未確認 |
-| Unicast 500 / FFplay低遅延 | 未測定 | 未測定 | 未測定 | 未測定 | 未測定 | 未確認 |
-| Unicast 1500 / FFplay低遅延 | 未測定 | 未測定 | 未測定 | 未測定 | 未測定 | 未確認 |
-| Unicast 500 / GStreamer | 未測定 | 未測定 | 未測定 | 未測定 | 未測定 | 未確認 |
-| Unicast 1500 / GStreamer | 未測定 | 未測定 | 未測定 | 未測定 | 未測定 | 未確認 |
+比較表は同じreceiver・AP・UI操作で記入する。commit、測定日時、receiverコマンド、各条件の区間数も併記する。
+
+| 計測項目 | 500 kbit/s | 1000 kbit/s | 1500 kbit/s |
+| --- | --- | --- | --- |
+| 配信秒数／5秒window数 | 未測定 | 未測定 | 未測定 |
+| capture / submitted / frames_written fps | 未測定 | 未測定 | 未測定 |
+| queue_replaced / stale_drop | 未測定 | 未測定 | 未測定 |
+| capture / readback 平均・最大ms | 未測定 | 未測定 | 未測定 |
+| queue_age 平均・最大ms | 未測定 | 未測定 | 未測定 |
+| stdin_write 平均・最大ms | 未測定 | 未測定 | 未測定 |
+| frame_age_written 平均・最大ms | 未測定 | 未測定 | 未測定 |
+| stdout bytes/秒・chunks/区間 | 未測定 | 未測定 | 未測定 |
+| 成功datagrams/秒・drop/秒 | 未測定 | 未測定 | 未測定 |
+| drop率 区間／累積% | 未測定 | 未測定 | 未測定 |
+| socket_sndbuf 実値 | 未測定 | 未測定 | 未測定 |
+| outq current / window_peak / peak | 未測定 | 未測定 | 未測定 |
+| qdisc backlog / drops | 未測定 | 未測定 | 未測定 |
+| PID安定・restart reason | 未確認 | 未確認 | 未確認 |
+| 画質・Packet corrupt／H.264エラー | 未確認 | 未確認 | 未確認 |
+| glass-to-glass 中央値／最大ms | 未測定 | 未測定 | 未測定 |
+| 診断stdin→stdout 平均／p95／最大ms（別試験） | 未測定 | 未測定 | 未測定 |
+
+成功基準: 全bitrateでdrop率ほぼ0、outqが恒常的に満杯にならない、queue replacementが0またはごく少数、stdin_writeがbitrate上昇で極端に悪化しない、frame_age_writtenはできれば50ms以下中心、PID安定、従来のunicast画質維持、glass-to-glassが約800／1300msから改善すること。
 
 負荷・温度・UI FPS、OFF/ON、消灯/復帰、Wi-Fi切断/再接続/IP変更、録画との排他も確認する。実機の受信PTSを調べる場合は、例えば短時間だけPCで`ffmpeg -i "udp://0.0.0.0:12346" -t 10 -c copy sample.ts`と記録し、`ffprobe -select_streams v:0 -show_frames -show_entries frame=pts_time -of csv sample.ts`でgapを確認する。採取中は別receiverを同時起動しない。
 
@@ -204,7 +257,7 @@ comma画面とPC画面を同時にスマートフォンの60fps以上で撮影�
 通常の単体テスト:
 
 ```sh
-python -m unittest openpilot.system.ui.lib.tests.test_screen_stream openpilot.system.ui.lib.tests.test_screen_capture openpilot.system.ui.lib.tests.test_screen_stream_settings -v
+python -m unittest openpilot.system.ui.lib.tests.test_screen_stream openpilot.system.ui.lib.tests.test_screen_capture openpilot.system.ui.lib.tests.test_screen_stream_settings openpilot.system.ui.lib.tests.test_screen_stream_diagnostics -v
 ```
 
 FFmpegパスをSCREEN_STREAM_TEST_FFMPEGへ指定すると、不規則入力の統合テストを実行できる。GPUテストには追加でSCREEN_STREAM_TEST_GPU=1を指定する。Linux例:
@@ -212,7 +265,7 @@ FFmpegパスをSCREEN_STREAM_TEST_FFMPEGへ指定すると、不規則入力の�
 ```sh
 SCREEN_STREAM_TEST_FFMPEG=/usr/bin/ffmpeg python -m unittest openpilot.system.ui.lib.tests.test_screen_stream_timestamps -v
 SCREEN_STREAM_TEST_FFMPEG=/usr/bin/ffmpeg SCREEN_STREAM_TEST_GPU=1 python -m unittest openpilot.system.ui.lib.tests.test_screen_stream_video -v
-SCREEN_STREAM_TEST_FFMPEG=/usr/bin/ffmpeg python -m openpilot.system.ui.lib.tests.benchmark_screen_stream --frames 100
+SCREEN_STREAM_TEST_FFMPEG=/usr/bin/ffmpeg python -m openpilot.system.ui.lib.tests.benchmark_screen_stream --frames 100 --output /tmp/stream-pipe.json
 ```
 
 Windows PowerShell例（パスは使用するFFmpegに変更）:
@@ -221,29 +274,60 @@ Windows PowerShell例（パスは使用するFFmpegに変更）:
 $env:SCREEN_STREAM_TEST_FFMPEG='C:\ffmpeg\bin\ffmpeg.exe'
 $env:SCREEN_STREAM_TEST_GPU='1'
 python -m unittest openpilot.system.ui.lib.tests.test_screen_stream_timestamps openpilot.system.ui.lib.tests.test_screen_stream_video -v
-python -m openpilot.system.ui.lib.tests.benchmark_screen_stream --frames 100
+python -m openpilot.system.ui.lib.tests.benchmark_screen_stream --frames 100 --output stream-pipe.json
 ```
 
-2026-09-22、Windows / Python 3.12 / FFmpeg 7.1 / Raylib 6.1-dev / RTX 3060で検証。単体78件、GPU・実UDP統合3件、不規則PTS統合2件（bitrate別subtestを含む）。Ruffとgit diff --checkも実行する。
+2026-09-22、Windows / Python 3.12 / FFmpeg 7.1で検証。単体89件、PTS・フレーム対応のFFmpeg統合3件、本番senderを使う実UDP診断1件が成功。既存GPU統合3件は維持したが、今回の実行セッションではGLFWの画面／OpenGL初期化に失敗したため再検証できなかった。初期化失敗時にネイティブアクセス違反を起こさないよう、明示的にskipする。前回コミットではRaylib 6.1-dev / RTX 3060で3件とも成功している。Ruffとgit diff --checkも確認する。
 
-既存の設定・翻訳・再起動・排他・送信エラー検証を維持し、188/1316 bytesの順序・完全性、単一TSの即送信、SO_SNDBUF実値、outq失敗の非致命性、75ms破棄、100ms書き込み期限、readback前の時刻、区間統計、250ms以上ブロックするnetwork/config照会中のフレーム書き込み、監視休止時の古い結果排除を追加した。Linuxのselect / ioctlはWindows上ではモックによる検証。GPU統合は実際のstdout→Python socket→UDP→復号で両方式を確認する。
+既存の設定・翻訳・再起動・排他・送信エラー・75ms破棄・100ms書き込み期限・キャプチャ時刻・monitor検証を維持。188／376／564／1316 bytesの順序とTS境界、564の既定集約、SO_SNDBUF強制指定なし、getsockopt、outq 100ms制限とwindow reset、区間比率・rate、混雑警告でもPID維持、5秒未満のfinal flushと例外時cleanupを検証する。Linux select / ioctlはWindowsではモック。フレーム診断は分割PESヘッダー・PTS・識別子・欠落／順序変更拒否を検証し、実FFmpegと本番Python senderのローカルUDP経路でbytesが一致した。
 
-開発PCの100frame・20fps相当・同一合成模様の計測:
+### 各frameのstdin完了からstdout初観測まで
 
-| bitrate kbit/s | stdin平均／最大ms | 初回stdout ms | throughput fps | 入力経過／PTS経過s |
+benchmark_screen_stream.pyは500／1000／1500／3000 kbit/sを順に測る。入力合成画像に16 bitのframe番号を白黒の帯で埋め、到着時刻・全stdin書き込み完了T1をperf_counterで記録する。stdoutでは各readの完了時刻と累積byte境界だけを記録し、読み取ったbytesを保持する。時間測定終了後にTSの映像PES PTSを解析し、そのPES先頭byteを含む最初のread時刻T2を割り当てる。[FFmpegのMPEG-TS muxer実装](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/mpegtsenc.c)のPTS形式に対応する。
+
+さらにFFmpegで復号し、frame番号が入力順に0～N-1で一致すること、入力・PES・復号frame数が等しいこと、PESと復号後の相対PTSが一致することを検査する。欠落・重複・順序変更・不一致は計測失敗とし、単にN番目のreadをN番目のframeとは見なさない。対象は本番コマンドの単一映像PID・B=0・各frameのPESであり、一般のTS解析器ではない。
+
+JSONのframe_timingsにinput_arrival_s、stdin_complete_s、pts_90k、stdout_first_observed_s、stdin_to_stdout_ms（T2−T1）、arrival_to_stdout_msを保存する。summaryは平均・p95・最大を含む。T2はPES先頭を読み取った観測時刻で、frame全体の出力完了・socket送信完了・受信時刻ではない。エンコーダ単体ではなく、mux・パイプ・OSスケジューリング・read単位の遅れも含む。writerがwriteから復帰する前にreaderが記録する場合は負値があり得るため、0へ丸めずnegative_latency_samplesも出す。
+
+通常のUI配信にはPES解析・frame番号・bytes保存を入れない。診断時も解析と復号は計測後なのでstdout読み出しを妨げない。ただしbytes保存と観測の処理負荷は残る。入力は同じ合成模様＋番号で、実UIの運動量・GPU負荷・最悪負荷を代表しない。
+
+開発PCのパイプ単独、100frame・20fps相当の実測（全条件で番号とPTSが一致、PTS経過4.950秒、負値0件）:
+
+| kbit/s | stdin平均／最大ms | 各frame stdin→stdout 平均／p95／最大ms | 到着→stdout平均ms | stdout bytes/秒 |
 | --- | --- | --- | --- | --- |
-| 500 | 0.95 / 13.23 | 22.19 | 20.08 | 4.949 / 4.950 |
-| 1500 | 1.03 / 13.91 | 26.64 | 20.07 | 4.950 / 4.950 |
-| 3000 | 0.99 / 13.59 | 21.79 | 20.07 | 4.950 / 4.950 |
+| 500 | 0.845 / 12.871 | 5.642 / 10.379 / 12.996 | 6.487 | 35,239 |
+| 1000 | 1.249 / 13.506 | 8.789 / 10.110 / 11.301 | 10.038 | 97,699 |
+| 1500 | 1.176 / 13.102 | 8.461 / 10.087 / 11.837 | 9.638 | 154,410 |
+| 3000 | 0.866 / 12.969 | 6.183 / 10.948 / 12.090 | 7.048 | 309,705 |
 
-時間はperf_counterで計測。初回stdoutはプロセス生成直後から最初のMPEG-TS bytesまでで、各frameのエンコード遅延やglass-to-glassではない。throughputは入力間隔を含む全処理時間の平均。合成模様は各frame同じため、実UIの運動量や最悪負荷を代表しない。ベンチマークはUDP・GPU・受信表示を含まない。数値をcomma実機へ外挿しない。
+初回stdoutは約21.7～22.2ms、全処理throughputは約20.07～20.09fps。パイプ単独はUDP・GPU・受信表示を含まない。設定bitrateと実際の出力bitrateも一致するとは限らない。この値からcomma実機の遅延や今回の改善量を推定しない。
 
-本体ビルド・Linux実socket計測・実機負荷・GStreamer受信・本家CI全体は未実施。Windowsの単体テストではswaglogのネイティブ依存をモックにし、cloudlogへ渡す内容を検証する。実機でcloudlogが保存されることは既報。
+| kbit/s | 実TS bytes | 188 / 376 / 564 / 1316でのdatagrams・sendto回数（TS長から計算） |
+| --- | --- | --- |
+| 500 | 175,404 | 933 / 467 / 311 / 134 |
+| 1000 | 486,544 | 2588 / 1294 / 863 / 370 |
+| 1500 | 769,108 | 4091 / 2046 / 1364 / 585 |
+| 3000 | 1,543,480 | 8210 / 4105 / 2737 / 1173 |
+
+### commaで逆圧を比較する診断
+
+通常のUDP Screen StreamingをOFFにし、競合するFFmpegがない状態で実行する。`--frames 400`なら各bitrate約20秒。最初はパイプ単独、次に同じ条件で本番MpegTsUdpSenderを通す。送信元・宛先は実際のWi-Fi IPv4へ置換し、UDP時はPCでreceiverを1つ起動する。
+
+```sh
+SCREEN_STREAM_TEST_FFMPEG=/usr/bin/ffmpeg python -m openpilot.system.ui.lib.tests.benchmark_screen_stream --frames 400 --output /tmp/stream-pipe.json
+SCREEN_STREAM_TEST_FFMPEG=/usr/bin/ffmpeg python -m openpilot.system.ui.lib.tests.benchmark_screen_stream --frames 400 --udp-address 192.168.4.44 --local-address 192.168.4.38 --port 12346 --output /tmp/stream-udp.json
+```
+
+FFmpegの実パスを指定する。UDP時もエンコーダのprotocol whitelistはfile,pipeのままで、FFmpegのUDP対応は不要。transport_statsは送信成功・drop率・outq・stdout量を含む全診断区間の集計であり、通常UIの5秒statsとは区別する。ローカル保存するTSはUDP送信前なので、送信dropがあってもローカルのframe対応検査は成功し得る。必ずtransport_statsとPC側の映像破損も確認する。
+
+パイプ単独でもT2−T1が大きければencoder／mux／読み出しを調べる。UDP経由だけでstdinやT2−T1が悪化し、drop・outqも増えれば下流負荷の影響を疑う。各bitrateで繰り返し、温度とCPU負荷も揃える。合成映像は通常UIとは異なるため、診断だけで実機UIの因果を断定しない。
+
+今回の本体ビルド・Linux実socket計測・変更後の実機負荷／画面遅延・本家CI全体は未実施。Windowsの単体テストではswaglogのネイティブ依存をモックにし、cloudlogへ渡す内容を検証する。実機でcloudlogが保存されることは既報。
 
 ## 残る要因と次段階
 
-100msには、20fps取得周期、end_drawingの表示待ち、同期GPU readback、Pythonコピー・スケジューリング、パイプとFFmpeg内部キュー、ソフトウェアx264、TS解析、無線再送、PC復号と表示同期が影響し得る。今回のstatsはFFmpeg内部の全frame待ち時間を直接測定しない。wallclock補正の不連続と20fps time baseの量子化も残る。
+100msには、20fps取得周期（1周期50ms）、end_drawingの表示待ち、Pythonコピー・スケジューリング、パイプとFFmpeg内部キュー、ソフトウェアx264、TS解析、無線再送、PC復号と表示同期が影響し得る。GPUは現状の実測では小さいため改修しない。今回のframe診断は合成映像のstdin→PES観測までで、実UIの全経路を直接計測するものではない。wallclock補正の不連続と20fps time baseの量子化も残る。
 
-まず今回の統計とreceiver比較で支配的な区間を特定する。GPUが支配的ならPBO、エンコードが支配的なら実機で存在確認したhardware encoderを検討する。MPEG-TS/receiver側が支配的で100msを切れない場合には、次段階としてAnnex-B → RTP/H.264 → UDP unicastを比較する。RTP化は今回未実装で、現時点で必須とは判断しない。
+まず564 bytes・OS既定SO_SNDBUFでdrop・outq・stdin・queueを再計測する。混雑を解消しても数百ms以上残り、パイプ単独のframe診断でencoder区間が大きければthreads=1等と実機で存在確認したhardware encoderを比較する。stdin→stdoutが小さく、残りがMPEG-TS／receiver側にあるならAnnex-B → RTP/H.264 → UDP unicastを比較する。今回RTP化・hardware encoder選択・PBOは行わず、MPEG-TSとthreads=2を維持する。
 
 [本家の開発ガイド](CONTRIBUTING.md)と[AI支援方針](AI_POLICY.md)に従い、コミットにAssisted-byを記載する。

@@ -49,6 +49,10 @@ class TestScreenStreamer(unittest.TestCase):
       transport.error = None
       transport.arguments = args
       transport.mode = 'multicast' if stream.ipaddress.IPv4Address(args[2].address).is_multicast else 'unicast'
+      transport.stats_snapshot.return_value = dict.fromkeys([
+        'sender_datagrams', 'sender_drops', 'sender_bytes', 'sender_datagrams_delta', 'sender_drops_delta',
+        'sender_drop_ratio_window_pct', 'socket_sndbuf', 'socket_outq_current', 'socket_outq_peak',
+      ], 0)
       self.senders.append(transport)
       return transport
 
@@ -272,6 +276,52 @@ class TestScreenStreamer(unittest.TestCase):
       wait_until(self.streamer.ready.is_set)
       scheduler.assert_called_once_with(0, 0, 0)
       priority.assert_not_called()
+
+  def test_final_stats_flush_once_before_config_restart(self):
+    self.enabled = True
+    self.streamer.start()
+    wait_until(self.streamer.ready.is_set)
+    self.streamer.stats.record({'capture_count': 3}, capture=.004)
+    self.config.return_value = ScreenStreamConfig(bitrate=1000)
+    wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
+    finals = [call.args[0] for call in self.cloudlog.info.call_args_list if 'screen stream latency final:' in call.args[0]]
+    self.assertEqual(len(finals), 1)
+    self.assertIn('config changed', finals[0])
+    self.assertIn('capture_count=3', finals[0])
+    self.assertIn('bitrate=1500', finals[0])
+    self.assertEqual(self.streamer.stats.snapshot()['capture_count'], 0)
+    messages = [call.args[0] for call in self.cloudlog.info.call_args_list]
+    stopped = next(i for i, message in enumerate(messages) if 'screen stream stopped:' in message)
+    self.assertLess(messages.index(finals[0]), stopped)
+    self.enabled = False
+    wait_until(lambda: self.streamer._proc is None)
+    time.sleep(.15)
+    finals = [call.args[0] for call in self.cloudlog.info.call_args_list if 'screen stream latency final:' in call.args[0]]
+    self.assertEqual(len(finals), 2)
+    self.assertIn('stream disabled', finals[-1])
+
+  def test_congestion_warning_does_not_restart_encoder(self):
+    self.enabled = True
+    with patch.object(stream, 'LATENCY_STATS_INTERVAL', .05):
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      self.senders[0].stats_snapshot.return_value.update(sender_datagrams_delta=90, sender_drops_delta=10,
+                                                        sender_drop_ratio_window_pct=10.0)
+      wait_until(lambda: 'screen stream UDP congestion:' in self.log_messages())
+      self.assertEqual(len(self.processes), 1)
+      self.assertEqual(self.streamer._restart_count, 0)
+      self.assertTrue(self.streamer.ready.is_set())
+
+  def test_final_stats_failure_still_closes_encoder(self):
+    self.enabled = True
+    self.streamer.start()
+    wait_until(self.streamer.ready.is_set)
+    self.senders[0].stats_snapshot.side_effect = ValueError('計測失敗')
+    self.enabled = False
+    wait_until(lambda: self.processes[0].stdin.close.called)
+    self.processes[0].terminate.assert_called_once()
+    self.senders[0].close.assert_called_once()
+    self.assertIn('screen stream latency final failed', self.log_messages())
 
   def test_repeated_network_timeouts_do_not_restart_or_spam(self):
     self.enabled = True
@@ -713,7 +763,7 @@ class TestMpegTsUdpSender(unittest.TestCase):
     else:
       self.assertEqual(sender.mode, 'unicast')
       sock.bind.assert_called_once_with(('192.168.4.38', 0))
-      sock.setsockopt.assert_called_once_with(stream.socket.SOL_SOCKET, stream.socket.SO_SNDBUF, stream.SO_SNDBUF_REQUEST)
+      sock.setsockopt.assert_not_called()
     sock.getsockopt.assert_called_once_with(stream.socket.SOL_SOCKET, stream.socket.SO_SNDBUF)
     self.assertEqual(sender.socket_sndbuf, 32768)
     sock.connect.assert_not_called()
@@ -725,8 +775,7 @@ class TestMpegTsUdpSender(unittest.TestCase):
     packets = [call.args[0] for call in calls]
     self.assertTrue(all(0 < len(packet) <= 1316 and len(packet) % 188 == 0 for packet in packets))
     self.assertTrue(all(len(packet) == sender.payload_size for packet in packets[:-1]))
-    if sender.mode == 'unicast':
-      self.assertTrue(all(len(packet) == 188 for packet in packets))
+    self.last_datagram_count = len(packets)
     self.assertEqual(sender.datagrams_sent, len(packets))
     self.assertEqual(sender.datagrams_dropped, 0)
     self.assertEqual(sender.bytes_sent, sum(map(len, packets)))
@@ -743,6 +792,81 @@ class TestMpegTsUdpSender(unittest.TestCase):
       with self.subTest(address=address):
         self.assertEqual(self.run_sender(chunks, ScreenStreamConfig(address, 15000, 3000, 2)), ts)
 
+  def test_all_candidate_payloads_preserve_sequence_and_reduce_send_calls(self):
+    ts = b''.join(b'\x47' + bytes([index % 256]) * 187 for index in range(211))
+    chunks = [ts[offset:offset + 997] for offset in range(0, len(ts), 997)]
+    self.assertEqual(stream.UNICAST_TS_PACKETS_PER_DATAGRAM, 3)
+    for packets in [1, 2, 3, 7]:
+      with self.subTest(packets=packets), patch.object(stream, 'UNICAST_TS_PACKETS_PER_DATAGRAM', packets):
+        self.assertEqual(self.run_sender(chunks, ScreenStreamConfig('192.168.4.44')), ts)
+        self.assertEqual(self.last_datagram_count, (211 + packets - 1) // packets)
+    self.assertEqual(self.run_sender(chunks), ts)
+    self.assertEqual(self.last_datagram_count, 31)
+
+  def test_stdout_observer_is_optional_and_preserves_chunks(self):
+    observed = []
+    chunks = [b'A' * 200, b'B' * 364]
+    with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'), \
+         patch.object(stream.os, 'read', side_effect=[*chunks, b'']):
+      create.return_value.sendto.return_value = 564
+      sender = stream.MpegTsUdpSender(Mock(), '192.168.4.38', ScreenStreamConfig('192.168.4.44'), observed.append)
+      sender.start()
+      try:
+        self.assertTrue(sender.done.wait(2))
+      finally:
+        sender.close()
+      self.assertIsNone(sender.error)
+      self.assertEqual(observed, chunks)
+      self.assertEqual((sender.stdout_bytes, sender.stdout_chunks), (564, 2))
+
+  def test_sender_window_statistics_ratios_rates_and_reset(self):
+    with patch.object(stream.socket, 'socket'), patch.object(stream.os, 'set_blocking'):
+      sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      try:
+        sender._stats_started = 0
+        sender.datagrams_sent, sender.datagrams_dropped = 90, 10
+        sender.bytes_sent, sender.stdout_bytes, sender.stdout_chunks = 9000, 10000, 20
+        sender.socket_outq_current, sender.socket_outq_peak, sender.socket_outq_window_peak = 100, 1000, 500
+        first = sender.stats_snapshot(5)
+        for key, value in {'sender_drop_ratio_pct': 10, 'sender_drop_ratio_window_pct': 10, 'stdout_bytes_per_sec': 2000,
+                            'stdout_chunks_delta': 20, 'datagrams_per_sec': 18, 'sender_drops_per_sec': 2,
+                            'socket_outq_window_peak': 500}.items():
+          self.assertEqual(first[key], value)
+        sender.datagrams_sent += 10
+        sender.socket_outq_window_peak = 200
+        second = sender.stats_snapshot(10)
+        self.assertEqual(second['sender_datagrams_delta'], 10)
+        self.assertEqual(second['sender_drops_delta'], 0)
+        self.assertEqual(second['sender_drop_ratio_pct'], round(1000 / 110, 4))
+        self.assertEqual(second['sender_drop_ratio_window_pct'], 0)
+        self.assertEqual(second['socket_outq_peak'], 1000)
+        self.assertEqual(second['socket_outq_window_peak'], 200)
+        empty = sender.stats_snapshot(15)
+        self.assertEqual(empty['datagrams_per_sec'], 0)
+        self.assertEqual(empty['sender_drop_ratio_window_pct'], 0)
+        self.assertIsNone(empty['socket_outq_window_peak'])
+      finally:
+        sender.close()
+
+  def test_outq_ioctl_is_rate_limited_even_when_stats_sample(self):
+    fcntl = Mock()
+    with patch.object(stream.socket, 'socket'), patch.object(stream.os, 'set_blocking'), \
+         patch.object(stream.sys, 'platform', 'linux'), patch.dict(sys.modules, {'fcntl': fcntl, 'termios': SimpleNamespace(TIOCOUTQ=0x5411)}):
+      sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      try:
+        with patch.object(stream.time, 'monotonic', return_value=1.0):
+          for _ in range(100):
+            sender.sample_outq()
+        self.assertEqual(fcntl.ioctl.call_count, 1)
+        with patch.object(stream.time, 'monotonic', return_value=1.099):
+          sender.sample_outq()
+        self.assertEqual(fcntl.ioctl.call_count, 1)
+        with patch.object(stream.time, 'monotonic', return_value=1.101):
+          sender.sample_outq()
+        self.assertEqual(fcntl.ioctl.call_count, 2)
+      finally:
+        sender.close()
+
   def test_unicast_ignores_multicast_ttl(self):
     for ttl in [1, 255]:
       with self.subTest(ttl=ttl):
@@ -757,7 +881,7 @@ class TestMpegTsUdpSender(unittest.TestCase):
       create.return_value.close.assert_called_once()
       create.return_value.setsockopt.assert_not_called()
 
-  def test_unicast_sends_single_ts_packet_without_waiting_for_more(self):
+  def test_unicast_sends_three_ts_packets_without_waiting_for_seven(self):
     read_fd, write_fd = os.pipe()
     self.addCleanup(os.close, write_fd)
     with os.fdopen(read_fd, 'rb', buffering=0) as stdout, patch.object(stream.socket, 'socket') as create:
@@ -766,8 +890,11 @@ class TestMpegTsUdpSender(unittest.TestCase):
       sender.start()
       try:
         os.write(write_fd, b'A' * 188)
+        time.sleep(.02)
+        create.return_value.sendto.assert_not_called()
+        os.write(write_fd, b'B' * 376)
         wait_until(lambda: sender.datagrams_sent == 1)
-        create.return_value.sendto.assert_called_once_with(b'A' * 188, ('192.168.4.44', 12346))
+        create.return_value.sendto.assert_called_once_with(b'A' * 188 + b'B' * 376, ('192.168.4.44', 12346))
       finally:
         sender.close()
 
@@ -798,11 +925,12 @@ class TestMpegTsUdpSender(unittest.TestCase):
          patch.object(stream.sys, 'platform', 'linux'), patch.dict(sys.modules, {'fcntl': fcntl, 'termios': SimpleNamespace(TIOCOUTQ=0x5411)}):
       sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', ScreenStreamConfig())
       try:
-        sender.sample_outq()
-        sender.sample_outq()
-        self.assertEqual(sender.socket_outq_current, 100)
-        self.assertEqual(sender.socket_outq_peak, 1000)
-        sender.sample_outq()
+        with patch.object(stream.time, 'monotonic', side_effect=[1.0, 1.2, 1.4]):
+          sender.sample_outq()
+          sender.sample_outq()
+          self.assertEqual(sender.socket_outq_current, 100)
+          self.assertEqual(sender.socket_outq_peak, 1000)
+          sender.sample_outq()
         self.assertIsNone(sender.socket_outq_current)
         self.assertEqual(sender.socket_outq_peak, 1000)
         self.assertIsNone(sender.error)
@@ -862,7 +990,7 @@ class TestMpegTsUdpSender(unittest.TestCase):
     for address in ['239.255.42.99', '192.168.4.44']:
       with self.subTest(address=address):
         config = ScreenStreamConfig(address)
-        size = 1316 if address.startswith('239.') else 188
+        size = 1316 if address.startswith('239.') else 564
         payloads = [bytes([i]) * size for i in range(3)]
         with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'), \
              patch.object(stream.os, 'read', side_effect=[b''.join(payloads), b'']):

@@ -22,6 +22,38 @@ stream = load_screen_stream()
 
 @unittest.skipUnless(os.getenv('SCREEN_STREAM_TEST_GPU') == '1', 'GPU統合テストは明示的に有効化してください')
 class TestScreenStreamVideo(unittest.TestCase):
+  def test_diagnostic_benchmark_through_production_udp_sender(self):
+    packets = []
+    stopped = threading.Event()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+      receiver.bind(('127.0.0.1', 0))
+      receiver.settimeout(.1)
+      receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+
+      def receive():
+        while True:
+          try:
+            packets.append(receiver.recv(65536))
+          except TimeoutError:
+            if stopped.is_set():
+              return
+
+      reader = threading.Thread(target=receive)
+      reader.start()
+      try:
+        # 本番設定のloopback拒否は維持し、実socketの試験用だけ置換する。
+        config = SimpleNamespace(**(vars(ScreenStreamConfig()) | {'address': '127.0.0.1', 'port': receiver.getsockname()[1]}))
+        ts, result = feed_frames(config, [0, .05, .10, .30, .35], frame_diagnostics=True, udp_local_address='127.0.0.1')
+      finally:
+        stopped.set()
+        reader.join(timeout=2)
+      self.assertFalse(reader.is_alive())
+      self.assertEqual(b''.join(packets), ts)
+      self.assertEqual(len(result['frame_timings']), 5)
+      self.assertEqual(result['transport_stats']['sender_drops'], 0)
+      self.assertEqual(result['transport_stats']['sender_datagrams'], len(packets))
+      self.assertTrue(all(len(packet) == 564 for packet in packets[:-1]))
+
   def test_gpu_capture_and_h264_transport_stream(self):
     self._check_stream(ScreenStreamConfig())
 
@@ -39,6 +71,8 @@ class TestScreenStreamVideo(unittest.TestCase):
     self.assertIsNotNone(ffmpeg, 'FFmpegが必要です')
     rl.set_config_flags(rl.ConfigFlags.FLAG_WINDOW_HIDDEN)
     rl.init_window(100, 50, '画面配信の統合テスト')
+    if not rl.is_window_ready():
+      self.skipTest('画面／OpenGLを初期化できない実行環境です')
     self.addCleanup(rl.close_window)
     source = rl.load_render_texture(100, 50)
     self.addCleanup(rl.unload_render_texture, source)

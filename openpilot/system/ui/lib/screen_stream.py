@@ -9,10 +9,12 @@ import socket
 import subprocess
 import threading
 import time
+import sys
 from collections.abc import Callable
 from typing import BinaryIO
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
+from openpilot.system.ui.lib.screen_stream_monitor import CachedQuery, LatencyStats
 
 WIDTH, HEIGHT, FPS = 800, 480, 20
 FRAME_BYTES = WIDTH * HEIGHT * 4
@@ -26,10 +28,15 @@ NETWORK_ERROR_LOG_INTERVAL = 10.0
 RETRY_INTERVAL = 3.0
 # 各D-Bus往復に250msを与え、複数の照会で期限を共有しない。個々の待機は短く制限する。
 NETWORK_REQUEST_TIMEOUT = 0.25
-FRAME_MAX_AGE = 0.25
-PIPE_WRITE_TIMEOUT = 0.50
+FRAME_MAX_AGE = 0.075
+PIPE_WRITE_TIMEOUT = 0.10
 TS_PACKET_SIZE = 188
-UDP_PAYLOAD_SIZE = TS_PACKET_SIZE * 7
+MULTICAST_TS_PACKETS_PER_DATAGRAM = 7
+UNICAST_TS_PACKETS_PER_DATAGRAM = 1
+UDP_PAYLOAD_SIZE = TS_PACKET_SIZE * MULTICAST_TS_PACKETS_PER_DATAGRAM
+SO_SNDBUF_REQUEST = 16 * 1024
+LATENCY_STATS_INTERVAL = 5.0
+ENCODER_PRESET = 'ultrafast'
 UDP_DROP_LOG_INTERVAL = 5.0
 TRANSIENT_SEND_ERRNOS = {
   getattr(errno, name) for name in ('EAGAIN', 'EWOULDBLOCK', 'ENOBUFS', 'EINTR',
@@ -95,11 +102,13 @@ def ffmpeg_command(config: ScreenStreamConfig = DEFAULT_CONFIG) -> list[str]:
   """エンコードとMPEG-TSのパイプ出力だけを行い、ネットワーク設定には依存しない。"""
   return [
     'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', '-nostats',
-    '-f', 'rawvideo', '-pixel_format', 'rgba', '-video_size', f'{WIDTH}x{HEIGHT}', '-framerate', str(FPS), '-i', 'pipe:0',
+    '-f', 'rawvideo', '-pixel_format', 'rgba', '-video_size', f'{WIDTH}x{HEIGHT}', '-framerate', str(FPS),
+    '-use_wallclock_as_timestamps', '1', '-i', 'pipe:0',
     '-an', '-vf', 'vflip,format=yuv420p', '-filter_threads', '1',
-    '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-tune', 'zerolatency', '-profile:v', 'baseline',
-    '-bf', '0', '-g', '10', '-keyint_min', '10', '-sc_threshold', '0', '-x264-params', 'repeat-headers=1',
-    '-b:v', f'{config.bitrate}k', '-maxrate', f'{config.bitrate}k', '-bufsize', f'{max(1, config.bitrate // 3)}k',
+    '-c:v', 'libx264', '-threads', '2', '-preset', ENCODER_PRESET, '-tune', 'zerolatency', '-profile:v', 'baseline',
+    '-bf', '0', '-g', '10', '-keyint_min', '10', '-sc_threshold', '0',
+    '-x264-params', 'sync-lookahead=0:rc-lookahead=0:sliced-threads=1:repeat-headers=1',
+    '-b:v', f'{config.bitrate}k', '-maxrate', f'{config.bitrate}k', '-bufsize', f'{max(1, config.bitrate // 10)}k',
     '-f', 'mpegts', '-mpegts_flags', '+resend_headers', '-muxdelay', '0', '-muxpreload', '0', '-flush_packets', '1',
     'pipe:1',
   ]
@@ -111,6 +120,10 @@ class MpegTsUdpSender:
     self._stdout = stdout
     self._destination = (config.address, config.port)
     self.mode = 'multicast' if ipaddress.IPv4Address(config.address).is_multicast else 'unicast'
+    self.payload_size = TS_PACKET_SIZE * (MULTICAST_TS_PACKETS_PER_DATAGRAM if self.mode == 'multicast' else UNICAST_TS_PACKETS_PER_DATAGRAM)
+    self.socket_sndbuf = None
+    self.socket_outq_current = self.socket_outq_peak = None
+    self._outq_lock = threading.Lock()
     self._stop = threading.Event()
     self.done = threading.Event()
     self.error: Exception | None = None
@@ -127,6 +140,8 @@ class MpegTsUdpSender:
       else:
         # ユニキャストも送信元をWi-Fiへ固定する。TTL設定はマルチキャストだけに適用する。
         self._socket.bind((local_address, 0))
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SO_SNDBUF_REQUEST)
+      self.socket_sndbuf = self._socket.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
       self._socket.setblocking(False)
       os.set_blocking(stdout.fileno(), False)
     except Exception:
@@ -165,6 +180,30 @@ class MpegTsUdpSender:
     self.bytes_sent += len(payload)
     return True
 
+  def sample_outq(self):
+    # Linuxのsocketキューをサンプリングする。NIC・無線・受信側のキューは含まない。
+    if not sys.platform.startswith('linux'):
+      return
+    try:
+      import array
+      import fcntl
+      import termios
+      pending = array.array('i', [0])
+      fcntl.ioctl(self._socket.fileno(), termios.TIOCOUTQ, pending, True)
+      with self._outq_lock:
+        self.socket_outq_current = pending[0]
+        self.socket_outq_peak = max(self.socket_outq_peak or 0, pending[0])
+    except (OSError, ValueError, TypeError, AttributeError, ImportError):
+      with self._outq_lock:
+        self.socket_outq_current = None
+
+  def _wait_readable(self):
+    if os.name == 'posix':
+      select.select([self._stdout.fileno()], [], [], 0.05)
+    else:
+      # Windowsの匿名パイプはselect非対応。開発PCでの検証のみ短い待機を使う。
+      self._stop.wait(0.001)
+
   def _run(self):
     pending = bytearray()
     try:
@@ -172,7 +211,7 @@ class MpegTsUdpSender:
         try:
           chunk = os.read(self._stdout.fileno(), 65536)
         except BlockingIOError:
-          self._stop.wait(0.01)
+          self._wait_readable()
           continue
         if not chunk:
           # 正常EOFだけ端数の完全なTSパケットを送り、停止時は古いstreamの末尾を送らない。
@@ -181,9 +220,10 @@ class MpegTsUdpSender:
             self._send_datagram(bytes(pending[:size]))
           return
         pending.extend(chunk)
-        while len(pending) >= UDP_PAYLOAD_SIZE and not self._stop.is_set():
-          self._send_datagram(bytes(pending[:UDP_PAYLOAD_SIZE]))
-          del pending[:UDP_PAYLOAD_SIZE]
+        while len(pending) >= self.payload_size and not self._stop.is_set():
+          self._send_datagram(bytes(pending[:self.payload_size]))
+          del pending[:self.payload_size]
+        self.sample_outq()
     except Exception as error:
       if not self._stop.is_set():
         self.error = error
@@ -209,25 +249,46 @@ class ScreenStreamer:
     self._restart_count = 0
     self._network_query_failures = 0
     self._last_network_error_log: float | None = None
+    self.stats = LatencyStats()
+    self._network_monitor = CachedQuery(network, lambda value: NETWORK_INTERVAL_CONNECTED if value is not None else NETWORK_INTERVAL_DISCONNECTED,
+                                        'ui-stream-network')
+    self._config_monitor = CachedQuery(config, lambda value: CONFIG_INTERVAL, 'ui-stream-config')
+    self._next_stats = 0.0
 
   def start(self):
     self._thread.start()
 
-  def submit(self, data: bytes):
+  def submit(self, data: bytes, captured: float | None = None):
     if not self.ready.is_set() or len(data) != FRAME_BYTES:
       return
     # UI側では待機せず、未処理の古いフレームを最新のものに置き換える。
+    replaced = 0
     try:
       self._frames.get_nowait()
+      replaced = 1
     except queue.Empty:
       pass
-    self._frames.put_nowait((time.monotonic(), data))
+    self._frames.put_nowait((time.monotonic() if captured is None else captured, data))
+    self.stats.record({'submitted_count': 1, 'queue_replaced_count': replaced})
 
   def close(self):
     self.ready.clear()
     self._stop.set()
     if self._thread.is_alive():
       self._thread.join(timeout=2.0)
+
+  def _log_latency_stats(self, config):
+    now = time.monotonic()
+    if self._proc is None or self._sender is None or now < self._next_stats:
+      return
+    self._next_stats = now + LATENCY_STATS_INTERVAL
+    sender = self._sender
+    sender.sample_outq()
+    values = self.stats.snapshot(reset=True)
+    values.update(pid=self._proc.pid, bitrate=config.bitrate, mode=sender.mode, sender_datagrams=sender.datagrams_sent,
+                  sender_drops=sender.datagrams_dropped, sender_bytes=sender.bytes_sent, socket_sndbuf=sender.socket_sndbuf,
+                  socket_outq_current=sender.socket_outq_current, socket_outq_peak=sender.socket_outq_peak)
+    cloudlog.info('screen stream latency stats: ' + ' '.join(f'{key}={value}' for key, value in values.items()))
 
   def _close_process(self, reason: str = "shutdown"):
     self.ready.clear()
@@ -321,12 +382,14 @@ class ScreenStreamer:
     network_checked = False
     current_config = ScreenStreamConfig()
     config_valid = False
-    next_config_check = next_network_check = next_retry = 0.0
+    config_generation = network_generation = -1
+    next_retry = 0.0
     try:
       if hasattr(os, 'sched_setscheduler'):
         # UIのリアルタイム優先度をエンコーダと送信スレッドへ継承させない。
         os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
-        os.setpriority(os.PRIO_PROCESS, 0, 10)
+      self._network_monitor.start()
+      self._config_monitor.start()
       while not self._stop.is_set():
         try:
           now = time.monotonic()
@@ -338,36 +401,40 @@ class ScreenStreamer:
             config_valid = False
             self._network_query_failures = 0
             self._last_network_error_log = None
-            next_config_check = next_network_check = 0.0
+            self._network_monitor.set_active(False)
+            self._config_monitor.set_active(False)
             self._stop.wait(0.1)
             continue
-          if now >= next_config_check:
-            try:
-              config = self._config()
-            except Exception as error:
+          self._network_monitor.set_active(True)
+          self._config_monitor.set_active(True)
+          settings = self._config_monitor.snapshot()
+          if settings.generation != config_generation:
+            config_generation = settings.generation
+            if settings.error is not None:
               config_valid = False
-              raise ScreenStreamError(f"invalid config: {error!r}") from error
-            config_valid = True
-            next_config_check = time.monotonic() + CONFIG_INTERVAL
-            if config != current_config:
-              reason = f"config changed old={current_config!r} new={config!r}"
+              raise ScreenStreamError(f"invalid config: {settings.error!r}") from settings.error
+            config_valid = settings.checked
+            if settings.checked and settings.value != current_config:
+              reason = f"config changed old={current_config!r} new={settings.value!r}"
               cloudlog.info(f"screen stream state: {reason}")
               if self._proc is not None:
                 self._close_process(reason)
-              current_config = config
+              current_config = settings.value
               next_retry = 0.0
 
-          if time.monotonic() >= next_network_check:
-            try:
-              network = self._network()
-            except Exception as error:
-              # 照会失敗は切断を意味しない。最後に確認できたWi-Fiと稼働中の送信処理を維持する。
-              self._log_network_query_error(current_network, error)
+          connection = self._network_monitor.snapshot()
+          if connection.generation != network_generation:
+            network_generation = connection.generation
+            if connection.error is not None:
+              self._network_query_failures = connection.failures - 1
+              self._log_network_query_error(current_network, connection.error)
             else:
-              if self._network_query_failures:
+              if connection.checked and self._network_query_failures:
                 cloudlog.info(f"screen stream network query recovered: failures={self._network_query_failures}")
                 self._network_query_failures = 0
                 self._last_network_error_log = None
+            if connection.checked:
+              network = connection.value
               if network != current_network or not network_checked:
                 reason = (f"network changed old={current_network!r} new={network!r}" if network is not None
                           else f"network unavailable old={current_network!r}")
@@ -377,8 +444,6 @@ class ScreenStreamer:
                 current_network = network
                 next_retry = 0.0
               network_checked = True
-            interval = NETWORK_INTERVAL_CONNECTED if current_network is not None else NETWORK_INTERVAL_DISCONNECTED
-            next_network_check = time.monotonic() + interval
 
           if self._stop.is_set() or not self.visible.is_set() or not self._enabled():
             continue
@@ -405,24 +470,40 @@ class ScreenStreamer:
               raise SenderFatalError(f"sender fatal error during setup: errno={error.errno} error={error!r}") from error
             self._sender.start()
             cloudlog.info(f"screen stream started: pid={self._proc.pid} mode={self._sender.mode} network={current_network!r} " +
-                          f"destination={current_config.address}:{current_config.port} bitrate={current_config.bitrate} ttl={current_config.ttl}")
+                          f"destination={current_config.address}:{current_config.port} bitrate={current_config.bitrate} ttl={current_config.ttl} " +
+                          f"socket_sndbuf={self._sender.socket_sndbuf} payload_size={self._sender.payload_size} preset={ENCODER_PRESET}")
+            self.stats.snapshot(reset=True)
+            self._next_stats = time.monotonic() + LATENCY_STATS_INTERVAL
             self.ready.set()
+          self._log_latency_stats(current_config)
           try:
             captured, data = self._frames.get(timeout=0.05)
           except queue.Empty:
             continue
-          if time.monotonic() - captured <= FRAME_MAX_AGE:
-            self._write_frame(captured, data)
+          age = time.monotonic() - captured
+          self.stats.record(queue_age=age)
+          if age < FRAME_MAX_AGE:
+            started = time.monotonic()
+            try:
+              self._write_frame(captured, data)
+            finally:
+              self.stats.record(stdin_write=time.monotonic() - started)
+            self.stats.record({'frames_written': 1}, frame_age_written=time.monotonic() - captured)
+          else:
+            self.stats.record({'stale_drop_count': 1})
         except StreamStopped as error:
           self._close_process(str(error))
-          next_config_check = next_network_check = 0.0
+          self._network_monitor.set_active(False)
+          self._config_monitor.set_active(False)
         except Exception as error:
           reason = str(error) if isinstance(error, ScreenStreamError) else f"unexpected error: {error!r}"
           self._log_restart(reason, exception=True)
           self._close_process(reason)
-          next_config_check = next_retry = time.monotonic() + RETRY_INTERVAL
+          next_retry = time.monotonic() + RETRY_INTERVAL
           self._stop.wait(0.1)
     except Exception:
       cloudlog.exception("screen stream worker failed")
     finally:
+      self._network_monitor.close()
+      self._config_monitor.close()
       self._close_process()

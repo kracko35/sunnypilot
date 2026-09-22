@@ -1,133 +1,119 @@
 # sunnypilot
 
-[sunnypilot](https://github.com/sunnypilot/sunnypilot) のUIを、Wi-Fi上のUDPユニキャスト／マルチキャストで配信する開発用forkです。録画経路のRenderTextureを共有し、FFmpegのMPEG-TS標準出力をPythonのUDP socketで送信します。MIB / MOST / AID側の変更は含みません。
+[sunnypilot](https://github.com/sunnypilot/sunnypilot) のUIをWi-Fi経由でH.264 / MPEG-TS / UDP配信する開発用forkです。現在は **ultra low latency experimental** 版として、unicastで端末間100ms以下を目標に計測・調整しています。100ms達成は未確認です。multicastと既存の設定互換性も維持します。
 
-A development fork of [sunnypilot](https://github.com/sunnypilot/sunnypilot) that streams its UI over Wi-Fi using UDP unicast or multicast, H.264 and MPEG-TS. It shares the recorder's RenderTexture capture path and sends FFmpeg's MPEG-TS stdout through a Python UDP socket. MIB / MOST / AID receiver changes are outside this repository.
+A development fork of [sunnypilot](https://github.com/sunnypilot/sunnypilot) that streams its UI over Wi-Fi using H.264 / MPEG-TS / UDP. This **ultra low latency experimental** version instruments and tunes unicast toward a sub-100 ms end-to-end target. That target has not been demonstrated on the device. Multicast and existing settings remain supported.
 
-## ブランチ / Branches
+## ブランチ / Branch
 
 ```text
 upstream/master
   └─ udp-screen-streaming
 ```
 
-`udp-screen-streaming`はmaster起点の開発・将来のPR用ブランチです。実機テスト用ブランチと変更の反映先は未定です。
+開発は`udp-screen-streaming`のみ。本家への将来のPR先はmasterで、実機テスト用ブランチとcherry-pick先は未定です。
 
-`udp-screen-streaming` is the development branch based on master for future upstream PRs. The device-test branch and integration target have not been selected.
+Development stays on `udp-screen-streaming`. Future upstream PRs target master; the device-test branch and cherry-pick destination are undecided.
 
 ## 使い方 / Usage
 
-1. 配信設定キーを含むソースのビルドを完了します。実機テスト用ブランチは未定です。 / Build the source with the streaming parameter keys. A device-test branch has not been selected.
-2. commaと受信端末を同じWi-Fiへ接続します。 / Connect comma and the receiver to the same Wi-Fi network.
-3. 設定の「トグル」→「UDP画面配信」をONにします。初期値はOFF、再起動不要です。英語UIでは “UDP Screen Streaming” と表示します。 / Enable “UDP Screen Streaming” in Settings → Toggles. It is off by default and takes effect without restarting.
-4. ONにするとアドレス・ポート・ビットレート・TTLの設定欄が表示されます。変更は保存後に自動反映されます。 / Enabling streaming reveals address, port, bitrate and TTL settings. Saved changes apply automatically.
-5. 送信先を選び、PCで以下の受信コマンドを実行します。 / Select the destination and run a receiver command below on the PC.
-
-通常受信: multicastは既定の送信先を使用し、`<PC_IP>`をPCのWi-Fi IPv4へ置換します。unicastは設定の送信先をPCのIPv4（例: `192.168.4.44`）へ変更します。コマンドはどちらか一方だけ実行してください。
-
-Normal reception: for multicast, keep the default destination and replace `<PC_IP>` with the PC's Wi-Fi IPv4. For unicast, set the destination to the PC's IPv4 (e.g. `192.168.4.44`). Run only one receiver at a time.
-
-```text
-multicast:
-ffplay "udp://239.255.42.99:12346?localaddr=<PC_IP>"
-
-unicast:
-ffplay "udp://0.0.0.0:12346"
-```
-
-低遅延テスト: 同じ送信設定で以下と比較します。受信FIFOはFFmpegの既定値を使います。
-
-Low-latency test: compare the following with the same sender settings. Leave the receive FIFO at FFmpeg's default.
-
-```text
-multicast:
-ffplay -max_delay 0 -avioflags direct -fflags nobuffer -flags low_delay -framedrop -probesize 4096 -analyzeduration 0 "udp://239.255.42.99:12346?localaddr=<PC_IP>"
-
-unicast:
-ffplay -max_delay 0 -avioflags direct -fflags nobuffer -flags low_delay -framedrop -probesize 4096 -analyzeduration 0 "udp://0.0.0.0:12346"
-```
-
-Windowsなどで特定インターフェースへ受信を束縛する場合は、unicast URLを`udp://0.0.0.0:12346?localaddr=192.168.4.44`へ変更します。APの端末間隔離やマルチキャスト制限があると受信できません。ポート変更時は受信URLのポートも変更します。
-
-To bind reception to a specific interface, including on Windows, use the unicast URL `udp://0.0.0.0:12346?localaddr=192.168.4.44`. AP client isolation or multicast filtering may prevent reception. Match the receiver port to the configured destination port.
-
-低遅延オプションの効果は実測が必要です。[方式比較・遅延測定手順](docs/ui_udp_stream.md#受信と切り分け)に、500/1500 kbit/sの比較と受信オプションを段階的に追加する手順を記載しています。設定は再起動後も保持されます。英語UI原文はsunnypilot標準の`tr`／`tr_noop`とPOで翻訳し、日本語を含む12言語に対応します。
-
-Measure the actual effect of low-latency options. The [transport and latency comparison guide (Japanese)](docs/ui_udp_stream.md#受信と切り分け) covers 500/1500 kbit/s trials and incremental receiver options. Settings persist across restarts. English UI source strings use sunnypilot's standard `tr` / `tr_noop` and PO catalogs, with translations for all 12 supported languages.
+1. 配信パラメーターを含むソースをビルドし、commaとPCを同じWi-Fiへ接続します。 / Build the source with streaming parameter keys and connect comma and the PC to the same Wi-Fi.
+2. Settings → Toggles → “UDP Screen Streaming”（日本語: UDP画面配信）をONにします。既定はOFFです。 / Enable “UDP Screen Streaming” in Settings → Toggles. It is off by default.
+3. “Destination Address”（送信先アドレス）にPCのWi-Fi IPv4（例: `192.168.4.44`）、ポートに`12346`を指定します。設定変更は自動反映されます。 / Set Destination Address to the PC's Wi-Fi IPv4 (e.g. `192.168.4.44`) and port to `12346`. Saved changes apply automatically.
+4. 以下の受信コマンドを1つだけ起動します。まず500 kbit/sで試し、1500 kbit/sで統計と遅延を比較します。 / Start one receiver below. Test at 500 kbit/s first, then compare statistics and latency at 1500 kbit/s.
 
 | 設定 / Setting | 許容値 / Allowed values | 既定値 / Default |
 | --- | --- | --- |
 | Destination Address / 送信先アドレス | 通常のIPv4 unicast、または / ordinary IPv4 unicast, or multicast 224.0.1.0–239.255.255.255 | 239.255.42.99 |
 | UDP Port | 1–65535 | 12346 |
 | Bitrate (kbit/s) | 250–8000 | 1500 |
-| Multicast TTL | 1–255 | 1 |
+| Multicast TTL | 1–255（unicastでは無視 / ignored for unicast） | 1 |
 
-TTLはmulticast専用で、同一ネットワークでは1を使用します。unicastでは保存値を送信に使いません。無効な入力は保存しません。0.0.0.0、0/8、loopback、link-local、予約済みIPv4、限定ブロードキャスト、224.0.0/24、IPv6、ホスト名、URL、ポートやクエリ付きアドレスは拒否します。既存の`ScreenStreamAddress`キーと既定値は維持します。配信設定キーのないビルドから導入する場合は再ビルドが必要です。
+既存Param名と既定値は維持し、保存済みのunicast宛先もそのまま使用します。0/8、loopback、link-local、予約済みIPv4、限定broadcast、224.0.0/24、IPv6、ホスト名、URL、ポートやクエリ付き入力は拒否します。英語UI原文を本家の`tr`／`tr_noop`とPOで翻訳し、既存の12言語を使用します。
 
-TTL applies only to multicast; use 1 for the local network. Unicast ignores the saved TTL. Invalid input is rejected, including unspecified, 0/8, loopback, link-local, reserved IPv4, limited broadcast, 224.0.0/24, IPv6, hostnames, URLs, and addresses with ports or query strings. The existing `ScreenStreamAddress` key and default remain unchanged. Rebuild when upgrading from a build without the streaming parameter keys.
+Existing parameter names, defaults, and saved unicast destinations are preserved. Validation rejects 0/8, loopback, link-local, reserved IPv4, limited broadcast, 224.0.0/24, IPv6, hostnames, URLs, and addresses containing ports or queries. English UI sources use upstream `tr` / `tr_noop` and PO catalogs for all 12 supported languages.
 
-## 送信経路 / Transport
+## PC受信 / PC reception
 
-```text
-UI RGBA → FFmpeg stdin → libx264 / MPEG-TS → stdout (pipe:1)
-                                               ↓
-                              Python socket → UDP unicast / multicast
-```
-
-comma 3Xで確認された標準FFmpegは`file`と`pipe`のみをサポートするため、FFmpegのUDPプロトコルには依存しません。必要なのは`libx264`、`mpegts`、`pipe`です。専用スレッドのPython socketで送信します。multicastはWi-Fi IPv4とTTLを設定し、unicastはWi-Fi IPv4へbindしてTTL設定を無視します。Python側で通常のUDPペイロードを1316 bytesへ集約し、正常終了時の最後だけ188 bytesの整数倍で短く送信できます。一時的な送信バッファ不足ではそのデータグラムだけを破棄し、FFmpegは維持します。
-
-The standard FFmpeg build reported on comma 3X supports only `file` and `pipe`, so streaming does not depend on FFmpeg's UDP protocol. It requires `libx264`, `mpegts`, and `pipe`. A dedicated Python socket thread sends the data. Multicast sets the Wi-Fi IPv4 interface and TTL; unicast binds to the Wi-Fi IPv4 and ignores the multicast TTL setting. Python coalesces normal UDP payloads to 1316 bytes; only the final payload at clean EOF may be shorter, in multiples of 188 bytes. Temporary send-buffer pressure drops the affected datagram while keeping FFmpeg running.
-
-フレーム取得から250msを超えた未送信フレームは破棄します。パイプの書き込み期限は書き込み開始から500msです。再起動理由・PID・UDP破棄数は標準のcloudlogへ記録します。[実機診断手順](docs/ui_udp_stream.md#実機での再起動診断)を参照してください。
-
-Queued frames older than 250ms are discarded. Pipe writes have a separate 500ms deadline measured from the start of writing. Restart reasons, PIDs and UDP drop counts are recorded through the standard cloudlog logger. See the [device diagnostics](docs/ui_udp_stream.md#実機での再起動診断).
-
-実機ログでは、複数のNetworkManager D-Bus照会が共有していた250msの期限超過を、配信障害として扱うことが周期的再起動の主因でした。各照会に独立した250msの期限を与え、照会失敗時は最後に確認できたWi-Fi情報で配信を続けます。正常な照会結果が未接続（`None`）なら停止し、接続先が変われば送信処理を再生成します。ネットワーク確認は接続中5秒・未接続時1秒、設定確認は独立した1秒周期です。
-
-Device logs identified a shared 250ms deadline across multiple NetworkManager D-Bus requests, with query timeouts treated as streaming failures, as the main cause of periodic restarts. Each request now receives its own 250ms timeout. Failed queries preserve the last known Wi-Fi connection and keep streaming; successful queries returning no connection (`None`) stop streaming, and connection changes rebuild the transport. Network checks run every 5 seconds while connected and every second while disconnected. Settings are checked independently every second.
-
-## 配信仕様 / Stream settings
-
-| 項目 / Item | 値 / Value |
-| --- | --- |
-| 既定の宛先 / Default destination | `239.255.42.99:12346` |
-| 映像 / Video | 800×480、最大20fps / up to 20 fps |
-| 縦横比 / Aspect ratio | 維持・余白は黒 / preserved with black bars |
-| エンコーダ / Encoder | libx264, baseline, yuv420p, veryfast, zerolatency |
-| ビットレート / Bitrate | 設定可能、既定1500 kbit/s。VBVは約1/3 / configurable, default 1500 kbit/s; VBV about one third |
-| GOP / Bフレーム / B-frames | 10 / 0 |
-| 形式 / Format | H.264 / MPEG-TS / UDP unicast or multicast |
-| TTL / UDP payload | multicast TTL設定可能（既定1）/ 通常1316 bytes / configurable multicast TTL (default 1), normally 1316 bytes |
-| フレーム待ち行列 / Pending frames | 最新1枚 / one latest frame |
-| 永続設定 / Persistent parameter | `ScreenStreamEnabled`、初期値OFF / default off |
-
-録画`RECORD=1`が優先され、同時配信しません。Wi-Fi未接続時・画面消灯時は停止し、接続・画面描画の再開時に自動復帰します。Wi-FiのIPv4に送信を束縛し、携帯回線・Ethernet・本体のAPモードでは配信しません。音声と描画後のデバッグ表示は含みません。
-
-`RECORD=1` takes precedence and disables streaming. Streaming stops while Wi-Fi is disconnected or the display is asleep and resumes automatically. Output is bound to the connected Wi-Fi IPv4; cellular, Ethernet and device hotspot mode are excluded. Audio and post-render debug overlays are not included.
-
-配信は暗号化・認証されません。有効化すると、同じWi-Fiの受信端末へ設定画面を含むUIが公開されます。OFFにすると配信とキャプチャを停止します。
-
-The stream is unencrypted and unauthenticated. Enabling it exposes the UI, including settings screens, to receivers on the same Wi-Fi. Disabling it stops streaming and capture.
-
-## 検証と開発 / Validation and development
-
-Windows開発PCで単体テスト65件とGPU・FFmpeg標準出力・Python socket・ループバックUDPの統合テスト3件（multicast 2件、unicast 1件）が成功しました。統合テストのエンコーダには`file,pipe`だけを許可しています。comma 3Xでは`9f0d5360e`でPID安定、送信21536件・local drop 0件の報告があります。一方、multicast受信の破損と約1000msの遅延が残っています。今回のunicast対応と受信オプションによる実機の改善、負荷・温度、MIB / MOST / AID表示は未検証です。
-
-On a Windows development PC, 65 unit tests and 3 GPU / FFmpeg stdout / Python socket / loopback UDP integration tests passed (2 multicast, 1 unicast). The test encoder permits only `file,pipe`. Device reports for `9f0d5360e` confirm a stable PID and 21,536 sends with zero local drops, but multicast corruption and roughly 1,000 ms latency remain. Device improvements from unicast and receiver options, load, temperature, and MIB / MOST / AID display remain unverified.
-
-[実装仕様・ビルド・実機テスト手順 / Implementation, build and device-test guide (Japanese)](docs/ui_udp_stream.md)
+通常のunicast受信 / Normal unicast reception:
 
 ```sh
-git clone --recurse-submodules --branch udp-screen-streaming \
-  https://github.com/kracko35/sunnypilot.git
-cd sunnypilot
-git remote add upstream https://github.com/sunnypilot/sunnypilot.git
-git fetch upstream
+ffplay "udp://0.0.0.0:12346"
 ```
 
-クローン後はリポジトリのディレクトリへ移動してからremoteを追加してください。本家へのPR先は`master`です。ブランチ更新と検証の詳細は上記手順書を参照してください。
+低遅延unicastテスト / Low-latency unicast test:
 
-After cloning, enter the repository directory before adding the remote. Future upstream PRs target `master`; see the guide for branch maintenance and validation.
+```sh
+ffplay -max_delay 0 -fflags nobuffer -flags low_delay -framedrop -probesize 4096 -analyzeduration 0 "udp://0.0.0.0:12346"
+```
+
+multicastは本体の送信先を`239.255.42.99`へ戻し、`<PC_IP>`をPCのWi-Fi IPv4へ置換します。 / For multicast, set the sender destination to `239.255.42.99` and replace `<PC_IP>` with the PC's Wi-Fi IPv4:
+
+```sh
+ffplay -max_delay 0 -fflags nobuffer -flags low_delay -framedrop -probesize 4096 -analyzeduration 0 "udp://239.255.42.99:12346?localaddr=<PC_IP>"
+```
+
+unicastの特定インターフェース待受には`udp://0.0.0.0:12346?localaddr=192.168.4.44`を使用します。`0.0.0.0`は受信URL専用で、本体の送信先には指定しません。APの端末間隔離や受信側ファイアウォールも確認してください。
+
+To bind unicast reception to a specific interface, use `udp://0.0.0.0:12346?localaddr=192.168.4.44`. Use `0.0.0.0` only in the receiver URL, never as the sender destination. Check AP client isolation and the receiver firewall.
+
+`-avioflags direct`は使用しません。Windows FFplayの実機試験で “Part of datagram lost due to insufficient buffer size” と映像破損が報告されたため、推奨から削除しました。受信FIFOは既定値を使用します。
+
+Do not use `-avioflags direct`: device testing with Windows FFplay reported “Part of datagram lost due to insufficient buffer size” and corrupted video. It has been removed from the recommended commands. Leave the receive FIFO at its default.
+
+GStreamerを導入済みの場合の低遅延unicast候補（PowerShell用1行） / Low-latency unicast candidate for an installed GStreamer environment (one line for PowerShell):
+
+```powershell
+gst-launch-1.0 -v udpsrc address=0.0.0.0 port=12346 buffer-size=65536 caps="video/mpegts,systemstream=(boolean)true,packetsize=(int)188" "!" tsdemux latency=0 "!" h264parse "!" avdec_h264 "!" queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "!" videoconvert "!" autovideosink sync=false async=false
+```
+
+PowerShellで改行する場合は行末にバッククォートを使用し、cmd用の`^`は使いません。GStreamerコマンドの実機動作・遅延は未確認です。必要なプラグインと比較手順は[手順書](docs/ui_udp_stream.md#受信と切り分け)を参照してください。
+
+For multiline PowerShell commands, use a trailing backtick, not cmd's `^`. Device operation and latency of this GStreamer command remain unverified. See the [guide (Japanese)](docs/ui_udp_stream.md#受信と切り分け) for required plugins and comparisons.
+
+## 実験版の変更 / Experimental changes
+
+| 項目 / Item | 設定 / Setting |
+| --- | --- |
+| 映像 / Video | 800×480、最大20fps、黒帯で縦横比維持 / up to 20 fps, aspect ratio preserved with black bars |
+| Timestamp | FFmpeg入力のwall clock / FFmpeg input wall clock |
+| Encoder | libx264 ultrafast, zerolatency, baseline, yuv420p, B=0, GOP=10, lookahead=0 |
+| VBV | bitrate / 10（1500 kbit/sなら150 kbit）/ 150 kbit at 1500 kbit/s |
+| 古い未送信frame / Stale pending frames | 75ms以上で破棄 / discard at 75 ms |
+| stdin書き込み期限 / Write deadline | 書き込み開始から100ms / 100 ms from write start |
+| Unicast | 188 bytes/datagram、SO_SNDBUF要求16 KiB / requested SO_SNDBUF 16 KiB |
+| Multicast | 従来どおり1316 bytes集約とTTL / existing 1316-byte coalescing and TTL |
+| 監視 / Monitoring | D-Bus・設定を別スレッドで照会 / separate D-Bus and configuration polling threads |
+| 統計 / Statistics | cloudlogへ約5秒ごと / cloudlog approximately every 5 seconds |
+
+RGBA → FFmpeg stdin → libx264 / MPEG-TS → stdout (`pipe:1`) → Python socketの経路を維持します。送信側FFmpegは`file`・`pipe`対応だけで動作し、UDPプロトコルを必要としません。Linuxではstdoutのread可能通知で送信を再開し、固定bitrate pacingは加えません。SCHED_OTHERを維持し、意図的なnice +10設定を廃止します。GPU readbackは同期方式のままです。
+
+The path remains RGBA → FFmpeg stdin → libx264 / MPEG-TS → stdout (`pipe:1`) → Python socket. Sender FFmpeg needs only `file` and `pipe`, not UDP protocol support. Linux waits for stdout readability without fixed-bitrate pacing. The worker stays on SCHED_OTHER and no longer sets nice +10. GPU readback remains synchronous.
+
+75msと100msは個別の処理上限で、合計100ms以下を保証しません。VBV値も実際の待ち時間を表すものではありません。短い期限による再起動、小さい送信バッファでの破棄、188-byte送信のCPU・無線負荷を統計で確認してください。
+
+The 75 ms and 100 ms limits apply to separate stages and do not guarantee a total below 100 ms. VBV size is not a measured buffering delay. Check statistics for restarts from shorter deadlines, drops from the smaller send buffer, and CPU/Wi-Fi overhead from 188-byte datagrams.
+
+録画`RECORD=1`を優先し、Wi-Fi未接続・消灯時は停止します。OFF時はキャプチャ・送信と定期照会を休止します。配信は暗号化・認証されず、設定画面も含まれます。音声と描画後のデバッグ表示は含まれません。
+
+`RECORD=1` takes precedence. Streaming stops when Wi-Fi is disconnected or the display sleeps. Disabling it pauses capture, transport, and polling. The stream is unencrypted and unauthenticated and includes settings screens. Audio and post-render debug overlays are excluded.
+
+## 検証・実機診断 / Validation and device diagnostics
+
+実機`40e0a4961`ではunicastで画質が大幅に改善し、PIDも安定したとの報告があります。ただし数百ms～約1000msの遅延が残り、1500 kbit/sの方が500より遅いと報告されています。両条件のqdisc backlog・drop等は0でした。今回の実験版による実機改善は未測定です。
+
+Device reports for `40e0a4961` confirm substantially better unicast quality and a stable PID, but hundreds of milliseconds to roughly 1 second of latency remain, with 1500 kbit/s slower than 500. Reported qdisc backlog and drop counters were zero at both rates. Device improvements from this experimental version remain unmeasured.
+
+開発PCでは不規則入力のPTS圧縮を再現し、wall-clock入力でgapが保たれることを500／1500／3000 kbit/sで確認しました。[検証結果・ベンチマーク・実機手順](docs/ui_udp_stream.md)を参照してください。
+
+Development-PC tests reproduced compressed PTS gaps and verified that wall-clock input preserves them at 500/1500/3000 kbit/s. See the [validation results, benchmark, and device guide (Japanese)](docs/ui_udp_stream.md).
+
+実機で最初に見る統計とハードウェアエンコーダの診断（自動採用はしません） / First device statistics to inspect and hardware-encoder discovery (no automatic selection):
+
+```sh
+grep -R -a "screen stream latency stats" /data/log 2>/dev/null | tail -30
+ffmpeg -hide_banner -encoders 2>/dev/null | grep -Ei 'h264|v4l2|qcom|omx|vaapi'
+```
 
 ## 本家・ライセンス / Upstream and license
 

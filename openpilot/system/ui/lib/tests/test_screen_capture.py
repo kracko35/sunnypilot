@@ -52,6 +52,24 @@ class TestScreenCapture(unittest.TestCase):
       self.assertRaises(ValueError, capture.read_rgba, self.source)
       raylib.unload_image.assert_called_once_with(image)
 
+  def test_capture_timestamp_precedes_gpu_work(self):
+    with patch.object(capture, 'rl'), patch.object(capture, 'read_rgba', return_value=b'frame'), \
+         patch.object(capture.time, 'monotonic', side_effect=[10.0, 10.01, 10.09]):
+      self.capture.capture(self.source)
+    self.streamer.submit.assert_called_once_with(b'frame', captured=10.0)
+    timing = self.streamer.stats.record.call_args
+    self.assertAlmostEqual(timing.kwargs['gpu_scale'], .01)
+    self.assertAlmostEqual(timing.kwargs['capture'], .09)
+
+  def test_readback_and_copy_have_separate_timings(self):
+    stats = Mock()
+    with patch.object(capture, 'rl') as raylib, patch.object(capture.time, 'monotonic', side_effect=[1.0, 1.02, 1.025]):
+      raylib.ffi.buffer.return_value = b'rgba'
+      self.assertEqual(capture.read_rgba(self.source, stats), b'rgba')
+      raylib.unload_image.assert_called_once()
+    self.assertAlmostEqual(stats.record.call_args.kwargs['readback'], .02)
+    self.assertAlmostEqual(stats.record.call_args.kwargs['bytes_copy'], .005)
+
 
 if __name__ == '__main__':
   unittest.main()

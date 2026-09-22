@@ -6,10 +6,15 @@ import pyray as rl
 from openpilot.system.ui.lib.screen_stream import WIDTH, HEIGHT, FPS, ScreenStreamer
 
 
-def read_rgba(texture: rl.Texture) -> bytes:
+def read_rgba(texture: rl.Texture, stats=None) -> bytes:
+  started = time.monotonic() if stats is not None else 0.0
   image = rl.load_image_from_texture(texture)
   try:
-    return bytes(rl.ffi.buffer(image.data, image.width * image.height * 4))
+    readback_done = time.monotonic() if stats is not None else 0.0
+    data = bytes(rl.ffi.buffer(image.data, image.width * image.height * 4))
+    if stats is not None:
+      stats.record(readback=readback_done - started, bytes_copy=time.monotonic() - readback_done)
+    return data
   finally:
     rl.unload_image(image)
 
@@ -36,7 +41,10 @@ class ScreenStreamCapture:
                         rl.Rectangle((WIDTH - width) / 2, (HEIGHT - height) / 2, width, height),
                         rl.Vector2(0, 0), 0.0, rl.WHITE)
     rl.end_texture_mode()
-    self.streamer.submit(read_rgba(self._texture.texture))
+    rendered = time.monotonic()
+    data = read_rgba(self._texture.texture, self.streamer.stats)
+    self.streamer.stats.record({'capture_count': 1}, gpu_scale=rendered - now, capture=time.monotonic() - now)
+    self.streamer.submit(data, captured=now)
 
   def release(self):
     if self._texture is not None:

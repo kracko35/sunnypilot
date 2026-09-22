@@ -2,11 +2,12 @@
 
 import errno
 import os
-import queue
 from contextlib import contextmanager
 from dataclasses import replace
 import subprocess
 import time
+import threading
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -213,14 +214,72 @@ class TestScreenStreamer(unittest.TestCase):
     self.assertIn('screen stream network query recovered:', self.log_messages())
     self.assertNotIn('screen stream restart:', self.log_messages())
 
+  def _check_blocked_query_does_not_block_frames(self, query, result):
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked():
+      entered.set()
+      release.wait(2)
+      return result
+
+    self.enabled = True
+    with patch.object(stream.os, 'write', return_value=stream.FRAME_BYTES) as write:
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      first = self.processes[0]
+      query.side_effect = blocked
+      try:
+        self.assertTrue(entered.wait(1))
+        started = time.monotonic()
+        for count in range(1, 7):
+          self.streamer.submit(bytes(stream.FRAME_BYTES))
+          wait_until(lambda count=count: write.call_count >= count, timeout=.2)
+          time.sleep(.05)
+        self.assertGreater(time.monotonic() - started, .25)
+        self.assertFalse(release.is_set())
+        self.assertEqual(self.processes, [first])
+        first.terminate.assert_not_called()
+      finally:
+        release.set()
+
+  def test_blocked_network_query_does_not_stop_frame_writes(self):
+    self._check_blocked_query_does_not_block_frames(self.network, self.network.return_value)
+
+  def test_blocked_config_query_does_not_stop_frame_writes(self):
+    self._check_blocked_query_does_not_block_frames(self.config, self.config.return_value)
+
+  def test_stats_are_periodic_and_include_transport_and_timings(self):
+    self.enabled = True
+    with patch.object(stream, 'LATENCY_STATS_INTERVAL', .1), patch.object(stream.os, 'write', return_value=stream.FRAME_BYTES):
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      self.streamer.stats.record({'capture_count': 1}, capture=.02, readback=.015, gpu_scale=.003, bytes_copy=.002)
+      self.streamer.submit(bytes(stream.FRAME_BYTES), captured=time.monotonic() - .03)
+      wait_until(lambda: 'screen stream latency stats:' in self.log_messages())
+      message = next(call.args[0] for call in self.cloudlog.info.call_args_list if 'screen stream latency stats:' in call.args[0])
+      for field in ['capture_count=1', 'submitted_count=1', 'frames_written=1', 'capture_avg_ms=20.0', 'readback_max_ms=15.0',
+                    'queue_replaced_count=', 'stale_drop_count=', 'queue_age_avg_ms=', 'stdin_write_max_ms=', 'pid=',
+                    'mode=multicast', 'bitrate=1500', 'sender_datagrams=', 'sender_drops=', 'sender_bytes=',
+                    'socket_sndbuf=', 'socket_outq_current=', 'socket_outq_peak=']:
+        self.assertIn(field, message)
+
+  def test_worker_drops_realtime_policy_without_lowering_nice(self):
+    self.enabled = True
+    with patch.object(stream.os, 'sched_setscheduler', create=True) as scheduler, \
+         patch.object(stream.os, 'sched_param', create=True, return_value=0), \
+         patch.object(stream.os, 'SCHED_OTHER', create=True, new=0), patch.object(stream.os, 'setpriority', create=True) as priority:
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      scheduler.assert_called_once_with(0, 0, 0)
+      priority.assert_not_called()
+
   def test_repeated_network_timeouts_do_not_restart_or_spam(self):
     self.enabled = True
-    with patch.object(stream, 'NETWORK_INTERVAL_CONNECTED', 0.0), \
-         patch.object(self.streamer._frames, 'get', side_effect=queue.Empty):
+    with patch.object(stream, 'NETWORK_INTERVAL_CONNECTED', 0.001):
       self.streamer.start()
       wait_until(self.streamer.ready.is_set)
       self.network.side_effect = TimeoutError('D-Bus待機期限')
-      wait_until(lambda: self.streamer._network_query_failures >= 100)
+      wait_until(lambda: self.streamer._network_query_failures >= 100, timeout=5.0)
       self.assertEqual(len(self.processes), 1)
       self.assertEqual(self.streamer._restart_count, 0)
       self.assertTrue(self.streamer.ready.is_set())
@@ -424,30 +483,31 @@ class TestScreenStreamer(unittest.TestCase):
     with patch.object(stream.os, 'write', return_value=stream.FRAME_BYTES) as write:
       self.streamer.start()
       wait_until(self.streamer.ready.is_set)
-      self.streamer._frames.put_nowait((time.monotonic() - stream.FRAME_MAX_AGE - 1, bytes(stream.FRAME_BYTES)))
+      self.streamer._frames.put_nowait((time.monotonic() - .080, bytes(stream.FRAME_BYTES)))
       wait_until(self.streamer._frames.empty)
       # 次の新鮮なフレームまで処理できれば、古いフレームによる書き込みも再起動もない。
       self.streamer.submit(bytes(stream.FRAME_BYTES))
       wait_until(lambda: write.call_count == 1)
       self.assertEqual(len(self.processes), 1)
       self.assertEqual(self.streamer._restart_count, 0)
+      self.assertEqual(self.streamer.stats.snapshot()['stale_drop_count'], 1)
 
   def test_pipe_deadline_starts_at_write_not_capture(self):
     self.streamer._proc = Mock()
-    with patch.object(stream.time, 'monotonic', side_effect=[10.0, 10.0, 10.4]), \
+    with patch.object(stream.time, 'monotonic', side_effect=[10.0, 10.0, 10.09]), \
          patch.object(stream.os, 'write', side_effect=[1, 2]) as write:
       self.streamer._write_frame(9.8, b'abc')
     self.assertEqual(write.call_count, 2)
 
   def test_pipe_timeout_reports_age_elapsed_and_remaining_bytes(self):
     self.streamer._proc = Mock()
-    with patch.object(stream.time, 'monotonic', side_effect=[10.0, 10.0, 10.51]), \
+    with patch.object(stream.time, 'monotonic', side_effect=[10.0, 10.0, 10.11]), \
          patch.object(stream.os, 'write', return_value=1):
       with self.assertRaises(stream.FrameWriteTimeout) as caught:
         self.streamer._write_frame(9.8, b'abc')
     message = str(caught.exception)
-    self.assertIn('age=0.710s', message)
-    self.assertIn('write_elapsed=0.510s', message)
+    self.assertIn('age=0.310s', message)
+    self.assertIn('write_elapsed=0.110s', message)
     self.assertIn('remaining_bytes=2', message)
 
   def test_screen_off_during_write_is_not_a_timeout(self):
@@ -480,6 +540,8 @@ class TestScreenStreamer(unittest.TestCase):
     self.streamer.submit(b'invalid')
     self.assertEqual(self.streamer._frames.qsize(), 1)
     self.assertEqual(self.streamer._frames.get_nowait()[1], bytes([9]) * stream.FRAME_BYTES)
+    self.assertEqual(self.streamer.stats.snapshot()['submitted_count'], 10)
+    self.assertEqual(self.streamer.stats.snapshot()['queue_replaced_count'], 9)
 
   def test_partial_writes_preserve_frame(self):
     self.streamer._proc = Mock()
@@ -597,6 +659,17 @@ class TestWifiAddress(unittest.TestCase):
 
 
 class TestCommand(unittest.TestCase):
+  def test_experimental_encoder_and_timestamp_options(self):
+    for bitrate in [500, 1500, 3000]:
+      command = stream.ffmpeg_command(ScreenStreamConfig(bitrate=bitrate))
+      for flag, value in [('-preset', 'ultrafast'), ('-tune', 'zerolatency'), ('-bf', '0'),
+                          ('-bufsize', f'{bitrate // 10}k'), ('-use_wallclock_as_timestamps', '1')]:
+        self.assertEqual(command[command.index(flag) + 1], value)
+      self.assertLess(command.index('-use_wallclock_as_timestamps'), command.index('-i'))
+      self.assertNotIn('-copyts', command)
+      self.assertNotIn('-start_at_zero', command)
+      self.assertIn('sync-lookahead=0:rc-lookahead=0:sliced-threads=1:repeat-headers=1', command)
+
   def test_uses_only_pipes_and_ignores_network_settings(self):
     command = stream.ffmpeg_command()
     self.assertEqual(command[-1], 'pipe:1')
@@ -606,7 +679,7 @@ class TestCommand(unittest.TestCase):
 
   def test_bitrate_controls_encoder(self):
     command = stream.ffmpeg_command(ScreenStreamConfig(bitrate=3000))
-    for flag, value in [('-b:v', '3000k'), ('-maxrate', '3000k'), ('-bufsize', '1000k')]:
+    for flag, value in [('-b:v', '3000k'), ('-maxrate', '3000k'), ('-bufsize', '300k')]:
       self.assertEqual(command[command.index(flag) + 1], value)
 
 
@@ -618,6 +691,7 @@ class TestMpegTsUdpSender(unittest.TestCase):
 
   def run_sender(self, chunks, config=stream.DEFAULT_CONFIG):
     sock = Mock()
+    sock.getsockopt.return_value = 32768
     sock.sendto.side_effect = lambda payload, destination: len(payload)
     with patch.object(stream.socket, 'socket', return_value=sock) as create, \
          patch.object(stream.os, 'set_blocking'), patch.object(stream.os, 'read', side_effect=[*chunks, b'']):
@@ -639,7 +713,9 @@ class TestMpegTsUdpSender(unittest.TestCase):
     else:
       self.assertEqual(sender.mode, 'unicast')
       sock.bind.assert_called_once_with(('192.168.4.38', 0))
-      sock.setsockopt.assert_not_called()
+      sock.setsockopt.assert_called_once_with(stream.socket.SOL_SOCKET, stream.socket.SO_SNDBUF, stream.SO_SNDBUF_REQUEST)
+    sock.getsockopt.assert_called_once_with(stream.socket.SOL_SOCKET, stream.socket.SO_SNDBUF)
+    self.assertEqual(sender.socket_sndbuf, 32768)
     sock.connect.assert_not_called()
     sock.setblocking.assert_called_once_with(False)
     sock.settimeout.assert_not_called()
@@ -648,7 +724,9 @@ class TestMpegTsUdpSender(unittest.TestCase):
     self.assertTrue(all(call.args[1] == (config.address, config.port) for call in calls))
     packets = [call.args[0] for call in calls]
     self.assertTrue(all(0 < len(packet) <= 1316 and len(packet) % 188 == 0 for packet in packets))
-    self.assertTrue(all(len(packet) == 1316 for packet in packets[:-1]))
+    self.assertTrue(all(len(packet) == sender.payload_size for packet in packets[:-1]))
+    if sender.mode == 'unicast':
+      self.assertTrue(all(len(packet) == 188 for packet in packets))
     self.assertEqual(sender.datagrams_sent, len(packets))
     self.assertEqual(sender.datagrams_dropped, 0)
     self.assertEqual(sender.bytes_sent, sum(map(len, packets)))
@@ -678,6 +756,58 @@ class TestMpegTsUdpSender(unittest.TestCase):
       self.assertRaises(OSError, stream.MpegTsUdpSender, Mock(), '192.168.4.38', ScreenStreamConfig('192.168.4.44'))
       create.return_value.close.assert_called_once()
       create.return_value.setsockopt.assert_not_called()
+
+  def test_unicast_sends_single_ts_packet_without_waiting_for_more(self):
+    read_fd, write_fd = os.pipe()
+    self.addCleanup(os.close, write_fd)
+    with os.fdopen(read_fd, 'rb', buffering=0) as stdout, patch.object(stream.socket, 'socket') as create:
+      create.return_value.sendto.side_effect = lambda payload, destination: len(payload)
+      sender = stream.MpegTsUdpSender(stdout, '127.0.0.1', ScreenStreamConfig('192.168.4.44'))
+      sender.start()
+      try:
+        os.write(write_fd, b'A' * 188)
+        wait_until(lambda: sender.datagrams_sent == 1)
+        create.return_value.sendto.assert_called_once_with(b'A' * 188, ('192.168.4.44', 12346))
+      finally:
+        sender.close()
+
+  def test_posix_pipe_wait_is_readiness_driven(self):
+    with patch.object(stream.socket, 'socket'), patch.object(stream.os, 'set_blocking'):
+      stdout = Mock()
+      stdout.fileno.return_value = 12
+      sender = stream.MpegTsUdpSender(stdout, '127.0.0.1', ScreenStreamConfig())
+      try:
+        with patch.object(stream.os, 'name', 'posix'), patch.object(stream.select, 'select', return_value=([12], [], [])) as wait:
+          sender._wait_readable()
+          wait.assert_called_once_with([12], [], [], .05)
+      finally:
+        sender.close()
+
+  def test_linux_outq_sampling_and_failure_are_nonfatal(self):
+    fcntl = Mock()
+    values = iter([1000, 100, OSError(errno.ENOTTY, '未対応')])
+
+    def ioctl(fd, request, output, mutate):
+      value = next(values)
+      if isinstance(value, Exception):
+        raise value
+      output[0] = value
+
+    fcntl.ioctl.side_effect = ioctl
+    with patch.object(stream.socket, 'socket'), patch.object(stream.os, 'set_blocking'), \
+         patch.object(stream.sys, 'platform', 'linux'), patch.dict(sys.modules, {'fcntl': fcntl, 'termios': SimpleNamespace(TIOCOUTQ=0x5411)}):
+      sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      try:
+        sender.sample_outq()
+        sender.sample_outq()
+        self.assertEqual(sender.socket_outq_current, 100)
+        self.assertEqual(sender.socket_outq_peak, 1000)
+        sender.sample_outq()
+        self.assertIsNone(sender.socket_outq_current)
+        self.assertEqual(sender.socket_outq_peak, 1000)
+        self.assertIsNone(sender.error)
+      finally:
+        sender.close()
 
   def test_eof_drops_only_incomplete_packet(self):
     for address in ['239.255.42.99', '192.168.4.44']:
@@ -732,10 +862,11 @@ class TestMpegTsUdpSender(unittest.TestCase):
     for address in ['239.255.42.99', '192.168.4.44']:
       with self.subTest(address=address):
         config = ScreenStreamConfig(address)
-        payloads = [bytes([i]) * 1316 for i in range(3)]
+        size = 1316 if address.startswith('239.') else 188
+        payloads = [bytes([i]) * size for i in range(3)]
         with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'), \
              patch.object(stream.os, 'read', side_effect=[b''.join(payloads), b'']):
-          create.return_value.sendto.side_effect = [1316, OSError(errno.ENOBUFS, '送信バッファ不足'), 1316]
+          create.return_value.sendto.side_effect = [size, OSError(errno.ENOBUFS, '送信バッファ不足'), size]
           sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', config)
           sender.start()
           try:
@@ -744,7 +875,7 @@ class TestMpegTsUdpSender(unittest.TestCase):
             sender.close()
           self.assertIsNone(sender.error)
           self.assertEqual([call.args[0] for call in create.return_value.sendto.call_args_list], payloads)
-          self.assertEqual((sender.datagrams_sent, sender.datagrams_dropped, sender.bytes_sent), (2, 1, 2632))
+          self.assertEqual((sender.datagrams_sent, sender.datagrams_dropped, sender.bytes_sent), (2, 1, size * 2))
 
   def test_drop_warning_is_aggregated_and_rate_limited(self):
     with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'):
@@ -800,6 +931,77 @@ class TestMpegTsUdpSender(unittest.TestCase):
               sender.close()
             self.assertIsInstance(sender.error, OSError)
             create.return_value.close.assert_called()
+
+
+class TestCachedQueriesAndStats(unittest.TestCase):
+  def test_disabled_query_discards_inflight_result_and_resumes_fresh(self):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def query():
+      calls.append(1)
+      if len(calls) == 1:
+        entered.set()
+        release.wait(2)
+        return '古い接続'
+      return '新しい接続'
+
+    monitor = stream.CachedQuery(query, lambda value: .01, 'test-cached-query')
+    monitor.start()
+    try:
+      time.sleep(.02)
+      self.assertEqual(calls, [])
+      monitor.set_active(True)
+      self.assertTrue(entered.wait(1))
+      started = time.monotonic()
+      self.assertFalse(monitor.snapshot().checked)
+      self.assertLess(time.monotonic() - started, .1)
+      monitor.set_active(False)
+      release.set()
+      time.sleep(.03)
+      self.assertFalse(monitor.snapshot().checked)
+      self.assertEqual(len(calls), 1)
+      monitor.set_active(True)
+      wait_until(lambda: monitor.snapshot().checked)
+      self.assertEqual(monitor.snapshot().value, '新しい接続')
+    finally:
+      release.set()
+      monitor.close()
+    self.assertFalse(monitor._thread.is_alive())
+
+  def test_monitor_retains_successful_none_and_tuple_across_errors(self):
+    query = Mock(return_value=('wlan0', '192.168.4.38'))
+    monitor = stream.CachedQuery(query, lambda value: .005, 'test-cached-query')
+    monitor.start()
+    monitor.set_active(True)
+    try:
+      wait_until(lambda: monitor.snapshot().checked)
+      query.side_effect = TimeoutError('待機期限')
+      wait_until(lambda: monitor.snapshot().failures >= 2)
+      self.assertEqual(monitor.snapshot().value, query.return_value)
+      query.side_effect = None
+      query.return_value = None
+      wait_until(lambda: monitor.snapshot().value is None)
+      generation = monitor.snapshot().generation
+      query.side_effect = TimeoutError('待機期限')
+      wait_until(lambda: monitor.snapshot().failures >= 1)
+      state = monitor.snapshot()
+      self.assertTrue(state.checked)
+      self.assertIsNone(state.value)
+      self.assertGreater(state.generation, generation)
+    finally:
+      monitor.close()
+
+  def test_stats_average_maximum_and_window_reset(self):
+    stats = stream.LatencyStats()
+    stats.record({'capture_count': 1}, capture=.01)
+    stats.record({'capture_count': 1}, capture=.03)
+    window = stats.snapshot(reset=True)
+    self.assertEqual(window['capture_count'], 2)
+    self.assertEqual(window['capture_avg_ms'], 20)
+    self.assertEqual(window['capture_max_ms'], 30)
+    self.assertEqual(stats.snapshot()['capture_count'], 0)
+    self.assertEqual(stats.snapshot()['capture_avg_ms'], 0)
 
 
 class TestStreamConfig(unittest.TestCase):

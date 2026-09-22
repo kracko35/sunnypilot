@@ -7,12 +7,14 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
 from openpilot.system.ui.lib.tests.screen_stream_test_support import load_screen_stream
 from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
+from openpilot.system.ui.lib.tests.benchmark_screen_stream import feed_frames
 
 
 stream = load_screen_stream()
@@ -62,9 +64,7 @@ class TestScreenStreamVideo(unittest.TestCase):
       command[1:1] = ['-protocol_whitelist', 'file,pipe']
       self.assertEqual(command[-1], 'pipe:1')
       self.assertNotIn('udp://', ' '.join(command))
-      encoded = subprocess.run(command, input=data * 20, capture_output=True, timeout=20)
-      self.assertEqual(encoded.returncode, 0, encoded.stderr.decode(errors='replace'))
-      ts = encoded.stdout
+      ts, _ = feed_frames(config, [i / stream.FPS for i in range(20)], frame=data)
       Path(output).write_bytes(ts)
       self.assertEqual(len(ts) % 188, 0)
       self.assertTrue(all(ts[offset] == 0x47 for offset in range(0, len(ts), 188)))
@@ -121,7 +121,10 @@ class TestScreenStreamVideo(unittest.TestCase):
 
             def write_frames():
               try:
-                for _ in range(20):
+                started = time.monotonic()
+                for index in range(20):
+                  while (delay := started + index / stream.FPS - time.monotonic()) > 0:
+                    time.sleep(delay)
                   remaining = memoryview(data)
                   while remaining:
                     written = proc.stdin.write(remaining)
@@ -162,7 +165,7 @@ class TestScreenStreamVideo(unittest.TestCase):
         self.assertFalse(reader.is_alive())
       self.assertTrue(packets, 'UDPを受信できませんでした')
       self.assertTrue(all(len(packet) <= 1316 and len(packet) % 188 == 0 for packet in packets))
-      self.assertTrue(all(len(packet) == 1316 for packet in packets[:-1]))
+      self.assertTrue(all(len(packet) == sender.payload_size for packet in packets[:-1]))
       self.assertEqual(sender.datagrams_dropped, 0)
       self.assertEqual(sender.datagrams_sent, len(packets))
       self.assertEqual(sender.bytes_sent, sum(map(len, packets)))

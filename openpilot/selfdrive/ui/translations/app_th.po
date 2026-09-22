@@ -101,6 +101,14 @@ msgstr "กลับ"
 msgid "Become a comma prime member at connect.comma.ai"
 msgstr "เป็นสมาชิกจุลภาคไพรม์ที่ Connect.comma.ai"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate (kbit/s)"
+msgstr "บิตเรต (kbit/s)"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate: 250 - 8000 kbit/s."
+msgstr "บิตเรต: 250 - 8000 kbit/s"
+
 #: openpilot/selfdrive/ui/widgets/pairing_dialog.py
 msgid "Bookmark connect.comma.ai to your home screen to use it like an app"
 msgstr "คั่นหน้า Connect.comma.ai ไปที่หน้าจอหลักของคุณเพื่อใช้เหมือนแอป"
@@ -362,6 +370,10 @@ msgstr "ติดตั้ง"
 msgid "IP Address"
 msgstr "ที่อยู่ IP"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "IPv4 multicast address (224.0.1.0 - 239.255.255.255)."
+msgstr "ที่อยู่ IPv4 แบบมัลติคาสต์ (224.0.1.0 - 239.255.255.255)"
+
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "If sponsorship status was not updated, please contact a moderator on the community forum at https://community.sunnypilot.ai"
 msgstr ""
@@ -369,6 +381,10 @@ msgstr ""
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Install Update"
 msgstr "ติดตั้งอัปเดต"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Invalid value"
+msgstr "ค่าไม่ถูกต้อง"
 
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "Join our Community Forum at https://community.sunnypilot.ai and reach out to a moderator if you have issues"
@@ -401,6 +417,14 @@ msgstr "สูงสุด"
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Maximize your training data uploads to improve openpilot's driving models."
 msgstr "เพิ่มการอัปโหลดข้อมูลการฝึกของคุณให้สูงสุดเพื่อปรับปรุงโมเดลการขับขี่ของ Openpilot"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast Address"
+msgstr "ที่อยู่มัลติคาสต์"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast TTL"
+msgstr "TTL มัลติคาสต์"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "N/A"
@@ -480,6 +504,10 @@ msgstr "จับคู่อุปกรณ์ของคุณกับกา
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Please connect to Wi-Fi to complete initial pairing"
 msgstr "โปรดเชื่อมต่อ Wi-Fi เพื่อทำการจับคู่ครั้งแรกให้เสร็จสิ้น"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Port: 1 - 65535."
+msgstr "พอร์ต: 1 - 65535"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Power Off"
@@ -629,6 +657,10 @@ msgstr "ซอฟต์แวร์"
 msgid "Standard"
 msgstr "มาตรฐาน"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Stream the UI over Wi-Fi. Recording or display sleep pauses streaming. Anyone on the same network can view the stream."
+msgstr "สตรีมอินเทอร์เฟซผ่าน Wi-Fi การบันทึกหรือการพักหน้าจอจะหยุดสตรีมชั่วคราว ทุกคนในเครือข่ายเดียวกันสามารถรับชมได้"
+
 #: openpilot/selfdrive/ui/onroad/alert_renderer.py
 msgid "System Unresponsive"
 msgstr "ระบบไม่ตอบสนอง"
@@ -641,6 +673,10 @@ msgstr "เข้าควบคุมทันที"
 msgid "TEMP"
 msgstr "อุณหภูมิ"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "TTL: 1 - 255. Use 1 for the local network."
+msgstr "TTL: 1 - 255 ใช้ 1 สำหรับเครือข่ายท้องถิ่น"
+
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Target Branch"
 msgstr "สาขาเป้าหมาย"
@@ -652,6 +688,14 @@ msgstr "รหัสผ่านการแชร์อินเทอร์เ
 #: openpilot/selfdrive/ui/layouts/settings/settings.py
 msgid "Toggles"
 msgstr "สลับ"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Port"
+msgstr "พอร์ต UDP"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Screen Streaming"
+msgstr "สตรีมหน้าจอผ่าน UDP"
 
 #: openpilot/selfdrive/ui/layouts/settings/developer.py
 msgid "UI Debug Mode"

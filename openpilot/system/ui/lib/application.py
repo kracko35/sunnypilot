@@ -21,6 +21,9 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.hardware import HARDWARE, PC
 from openpilot.system.ui.lib.multilang import FONT_FALLBACK_LANGUAGES, TRANSLATIONS_DIR, multilang
 from openpilot.common.realtime import Ratekeeper
+from openpilot.system.ui.lib.screen_capture import ScreenStreamCapture, read_rgba
+from openpilot.system.ui.lib.screen_stream import ScreenStreamer
+from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
 
 from openpilot.system.ui.sunnypilot.lib.application import GuiApplicationExt
 
@@ -242,6 +245,7 @@ class GuiApplication(GuiApplicationExt):
     self._ffmpeg_queue: queue.Queue | None = None
     self._ffmpeg_thread: threading.Thread | None = None
     self._ffmpeg_stop_event: threading.Event | None = None
+    self._screen_stream: ScreenStreamCapture | None = None
     self._textures: dict[str, rl.Texture] = {}
     self._target_fps: int = _DEFAULT_FPS
     self._last_fps_log_time: float = time.monotonic()
@@ -476,6 +480,31 @@ class GuiApplication(GuiApplicationExt):
   def set_should_render(self, should_render: bool):
     self._should_render = should_render
 
+  def enable_screen_stream(self, enabled: Callable[[], bool], config: Callable[[], ScreenStreamConfig] = ScreenStreamConfig):
+    # RECORDを優先し、録画と配信で同時にエンコードしない。
+    if not RECORD and self._screen_stream is None:
+      streamer = ScreenStreamer(enabled, config=config)
+      self._screen_stream = ScreenStreamCapture(streamer)
+      streamer.start()
+
+  def _update_screen_stream(self):
+    if self._screen_stream is None:
+      return
+    streamer = self._screen_stream.streamer
+    if self._should_render:
+      streamer.visible.set()
+    else:
+      streamer.visible.clear()
+    if streamer.ready.is_set() and self._should_render:
+      if self._render_texture is None:
+        self._render_texture = rl.load_render_texture(self._scaled_width, self._scaled_height)
+        rl.set_texture_filter(self._render_texture.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+    else:
+      self._screen_stream.release()
+      if self._render_texture is not None and self._scale == 1.0 and not BURN_IN_MODE and not RECORD:
+        rl.unload_render_texture(self._render_texture)
+        self._render_texture = None
+
   def texture(self, asset_path: str, width: int | None = None, height: int | None = None,
               alpha_premultiply=False, keep_aspect_ratio=True, flip_x: bool = False) -> rl.Texture:
     if width is not None:
@@ -571,6 +600,10 @@ class GuiApplication(GuiApplicationExt):
     if not rl.is_window_ready():
       return
 
+    if self._screen_stream is not None:
+      self._screen_stream.close()
+      self._screen_stream = None
+
     for texture in self._textures.values():
       rl.unload_texture(texture)
     self._textures = {}
@@ -615,6 +648,7 @@ class GuiApplication(GuiApplicationExt):
 
       while not (self._window_close_requested or rl.window_should_close()):
         frame_start = time.monotonic()
+        self._update_screen_stream()
 
         if PC:
           # Thread is not used on PC, need to manually add mouse events
@@ -689,11 +723,9 @@ class GuiApplication(GuiApplicationExt):
         rl.end_drawing()
 
         if RECORD:
-          image = rl.load_image_from_texture(self._render_texture.texture)
-          data_size = image.width * image.height * 4
-          data = bytes(rl.ffi.buffer(image.data, data_size))
-          self._ffmpeg_queue.put(data)  # Async write via background thread
-          rl.unload_image(image)
+          self._ffmpeg_queue.put(read_rgba(self._render_texture.texture))
+        elif self._screen_stream is not None and self._render_texture is not None:
+          self._screen_stream.capture(self._render_texture.texture)
 
         self._monitor_fps()
         self._frame += 1

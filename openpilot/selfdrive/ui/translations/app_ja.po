@@ -101,6 +101,14 @@ msgstr "戻る"
 msgid "Become a comma prime member at connect.comma.ai"
 msgstr "connect.comma.aiで comma prime に加入"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate (kbit/s)"
+msgstr "ビットレート（kbit/s）"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate: 250 - 8000 kbit/s."
+msgstr "ビットレート：250～8000 kbit/s。"
+
 #: openpilot/selfdrive/ui/widgets/pairing_dialog.py
 msgid "Bookmark connect.comma.ai to your home screen to use it like an app"
 msgstr "connect.comma.aiをホーム画面に追加してアプリのように使いましょう"
@@ -362,6 +370,10 @@ msgstr "インストール"
 msgid "IP Address"
 msgstr "IPアドレス"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "IPv4 multicast address (224.0.1.0 - 239.255.255.255)."
+msgstr "IPv4マルチキャストアドレス（224.0.1.0～239.255.255.255）。"
+
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "If sponsorship status was not updated, please contact a moderator on the community forum at https://community.sunnypilot.ai"
 msgstr ""
@@ -369,6 +381,10 @@ msgstr ""
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Install Update"
 msgstr "アップデートをインストール"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Invalid value"
+msgstr "無効な値です"
 
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "Join our Community Forum at https://community.sunnypilot.ai and reach out to a moderator if you have issues"
@@ -401,6 +417,14 @@ msgstr "最大"
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Maximize your training data uploads to improve openpilot's driving models."
 msgstr "学習データのアップロードを最大化してopenpilotの運転モデルを改善しましょう。"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast Address"
+msgstr "マルチキャストアドレス"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast TTL"
+msgstr "マルチキャストTTL"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "N/A"
@@ -480,6 +504,10 @@ msgstr "デバイスを comma connect（connect.comma.ai）とペアリングし
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Please connect to Wi-Fi to complete initial pairing"
 msgstr "初回ペアリングを完了するにはWi‑Fiに接続してください"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Port: 1 - 65535."
+msgstr "ポート：1～65535。"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Power Off"
@@ -629,6 +657,10 @@ msgstr "ソフトウェア"
 msgid "Standard"
 msgstr "スタンダード"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Stream the UI over Wi-Fi. Recording or display sleep pauses streaming. Anyone on the same network can view the stream."
+msgstr "Wi-Fi経由でUIを配信します。録画中や画面消灯中は配信を一時停止します。同じネットワーク上の端末から視聴できます。"
+
 #: openpilot/selfdrive/ui/onroad/alert_renderer.py
 msgid "System Unresponsive"
 msgstr "システムが応答しません"
@@ -641,6 +673,10 @@ msgstr "すぐに手動介入してください"
 msgid "TEMP"
 msgstr "温度"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "TTL: 1 - 255. Use 1 for the local network."
+msgstr "TTL：1～255。同一ネットワーク内では1を使用してください。"
+
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Target Branch"
 msgstr "対象ブランチ"
@@ -652,6 +688,14 @@ msgstr "テザリングのパスワード"
 #: openpilot/selfdrive/ui/layouts/settings/settings.py
 msgid "Toggles"
 msgstr "トグル"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Port"
+msgstr "UDPポート"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Screen Streaming"
+msgstr "UDP画面配信"
 
 #: openpilot/selfdrive/ui/layouts/settings/developer.py
 msgid "UI Debug Mode"

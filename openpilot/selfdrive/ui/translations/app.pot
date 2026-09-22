@@ -869,3 +869,47 @@ msgstr ""
 msgid "camera starting"
 msgstr ""
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate (kbit/s)"
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate: 250 - 8000 kbit/s."
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "IPv4 multicast address (224.0.1.0 - 239.255.255.255)."
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Invalid value"
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast Address"
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast TTL"
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Port: 1 - 65535."
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Stream the UI over Wi-Fi. Recording or display sleep pauses streaming. Anyone on the same network can view the stream."
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "TTL: 1 - 255. Use 1 for the local network."
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Port"
+msgstr ""
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Screen Streaming"
+msgstr ""
+

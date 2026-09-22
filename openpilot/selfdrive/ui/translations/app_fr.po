@@ -101,6 +101,14 @@ msgstr "Retour"
 msgid "Become a comma prime member at connect.comma.ai"
 msgstr "Devenez membre comma prime sur connect.comma.ai"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate (kbit/s)"
+msgstr "Débit (kbit/s)"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate: 250 - 8000 kbit/s."
+msgstr "Débit : 250 - 8000 kbit/s."
+
 #: openpilot/selfdrive/ui/widgets/pairing_dialog.py
 msgid "Bookmark connect.comma.ai to your home screen to use it like an app"
 msgstr "Ajoutez connect.comma.ai à votre écran d'accueil pour l'utiliser comme une application"
@@ -362,6 +370,10 @@ msgstr "INSTALLER"
 msgid "IP Address"
 msgstr "Adresse IP"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "IPv4 multicast address (224.0.1.0 - 239.255.255.255)."
+msgstr "Adresse IPv4 multicast (224.0.1.0 - 239.255.255.255)."
+
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "If sponsorship status was not updated, please contact a moderator on the community forum at https://community.sunnypilot.ai"
 msgstr "Si le statut de parrainage n'a pas été mis à jour, veuillez contacter un modérateur sur le forum communautaire à https://community.sunnypilot.ai"
@@ -369,6 +381,10 @@ msgstr "Si le statut de parrainage n'a pas été mis à jour, veuillez contacter
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Install Update"
 msgstr "Installer la mise à jour"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Invalid value"
+msgstr "Valeur invalide"
 
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "Join our Community Forum at https://community.sunnypilot.ai and reach out to a moderator if you have issues"
@@ -401,6 +417,14 @@ msgstr "MAX"
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Maximize your training data uploads to improve openpilot's driving models."
 msgstr "Maximisez vos envois de données d'entraînement pour améliorer les modèles de conduite d'openpilot."
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast Address"
+msgstr "Adresse multicast"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast TTL"
+msgstr "TTL multicast"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "N/A"
@@ -480,6 +504,10 @@ msgstr "Associez votre appareil à comma connect (connect.comma.ai) et réclamez
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Please connect to Wi-Fi to complete initial pairing"
 msgstr "Veuillez vous connecter au Wi‑Fi pour terminer l'association initiale"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Port: 1 - 65535."
+msgstr "Port : 1 - 65535."
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Power Off"
@@ -629,6 +657,10 @@ msgstr "Logiciel"
 msgid "Standard"
 msgstr "Standard"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Stream the UI over Wi-Fi. Recording or display sleep pauses streaming. Anyone on the same network can view the stream."
+msgstr "Diffuse l’interface via Wi-Fi. L’enregistrement ou la mise en veille de l’écran suspend la diffusion. Tous les appareils du même réseau peuvent la regarder."
+
 #: openpilot/selfdrive/ui/onroad/alert_renderer.py
 msgid "System Unresponsive"
 msgstr "Système non réactif"
@@ -641,6 +673,10 @@ msgstr "REPRENEZ IMMÉDIATEMENT LE CONTRÔLE"
 msgid "TEMP"
 msgstr "TEMP."
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "TTL: 1 - 255. Use 1 for the local network."
+msgstr "TTL : 1 - 255. Utilisez 1 pour le réseau local."
+
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Target Branch"
 msgstr "Branche cible"
@@ -652,6 +688,14 @@ msgstr "Mot de passe de partage"
 #: openpilot/selfdrive/ui/layouts/settings/settings.py
 msgid "Toggles"
 msgstr "Options"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Port"
+msgstr "Port UDP"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Screen Streaming"
+msgstr "Diffusion de l’écran par UDP"
 
 #: openpilot/selfdrive/ui/layouts/settings/developer.py
 msgid "UI Debug Mode"

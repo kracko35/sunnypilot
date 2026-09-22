@@ -5,9 +5,11 @@ from openpilot.cereal import log
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl, BigMultiParamToggle, BigToggle, GreyBigButton
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationCircleButton
-from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.application import RECORD, gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.system.ui.lib.multilang import tr
+from openpilot.system.ui.widgets.screen_stream_settings import ScreenStreamSettings, STREAM_TITLE
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
@@ -49,6 +51,9 @@ class TogglesLayoutMici(NavScroller):
     always_on_dm_toggle = BigParamControl("always-on driver monitor", "AlwaysOnDM")
     record_front = BigParamControl("record & upload cabin camera", "RecordFront", toggle_callback=restart_needed_callback)
     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
+    self._stream_settings = ScreenStreamSettings(ui_state.params, compact=True)
+    screen_stream = self._screen_stream = BigParamControl(tr(STREAM_TITLE), "ScreenStreamEnabled")
+    screen_stream.set_enabled(not RECORD)
     enable_openpilot = BigParamControl("enable sunnypilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
 
     self._scroller.add_widgets([
@@ -59,6 +64,8 @@ class TogglesLayoutMici(NavScroller):
       always_on_dm_toggle,
       record_front,
       record_mic,
+      screen_stream,
+      *self._stream_settings.items.values(),
       enable_openpilot,
     ])
 
@@ -70,6 +77,7 @@ class TogglesLayoutMici(NavScroller):
       ("AlwaysOnDM", always_on_dm_toggle),
       ("RecordFront", record_front),
       ("RecordAudio", record_mic),
+      ("ScreenStreamEnabled", screen_stream),
       ("OpenpilotEnabledToggle", enable_openpilot),
     )
 
@@ -85,6 +93,7 @@ class TogglesLayoutMici(NavScroller):
 
   def _update_state(self):
     super()._update_state()
+    self._stream_settings.refresh()
 
     if ui_state.sm.updated["selfdriveState"]:
       personality = PERSONALITY_TO_INT[ui_state.sm["selfdriveState"].personality]
@@ -98,6 +107,8 @@ class TogglesLayoutMici(NavScroller):
 
   def _update_toggles(self):
     ui_state.update_params()
+    self._screen_stream.set_text(tr(STREAM_TITLE))
+    self._stream_settings.refresh(force=True)
 
     # CP gating for experimental mode
     if ui_state.CP is not None:

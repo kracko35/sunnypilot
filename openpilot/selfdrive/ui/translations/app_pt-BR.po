@@ -101,6 +101,14 @@ msgstr "Voltar"
 msgid "Become a comma prime member at connect.comma.ai"
 msgstr "Torne-se membro comma prime em connect.comma.ai"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate (kbit/s)"
+msgstr "Taxa de bits (kbit/s)"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Bitrate: 250 - 8000 kbit/s."
+msgstr "Taxa de bits: 250 - 8000 kbit/s."
+
 #: openpilot/selfdrive/ui/widgets/pairing_dialog.py
 msgid "Bookmark connect.comma.ai to your home screen to use it like an app"
 msgstr "Adicione connect.comma.ai à tela inicial para usá-lo como um app"
@@ -362,6 +370,10 @@ msgstr "INSTALAR"
 msgid "IP Address"
 msgstr "Endereço IP"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "IPv4 multicast address (224.0.1.0 - 239.255.255.255)."
+msgstr "Endereço IPv4 multicast (224.0.1.0 - 239.255.255.255)."
+
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "If sponsorship status was not updated, please contact a moderator on the community forum at https://community.sunnypilot.ai"
 msgstr ""
@@ -369,6 +381,10 @@ msgstr ""
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Install Update"
 msgstr "Instalar Atualização"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Invalid value"
+msgstr "Valor inválido"
 
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "Join our Community Forum at https://community.sunnypilot.ai and reach out to a moderator if you have issues"
@@ -401,6 +417,14 @@ msgstr "MÁX"
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Maximize your training data uploads to improve openpilot's driving models."
 msgstr "Maximize seus envios de dados de treinamento para melhorar os modelos de condução do openpilot."
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast Address"
+msgstr "Endereço multicast"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Multicast TTL"
+msgstr "TTL multicast"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "N/A"
@@ -480,6 +504,10 @@ msgstr "Emparelhe seu dispositivo com o comma connect (connect.comma.ai) e resga
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Please connect to Wi-Fi to complete initial pairing"
 msgstr "Conecte-se ao Wi‑Fi para concluir o emparelhamento inicial"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Port: 1 - 65535."
+msgstr "Porta: 1 - 65535."
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Power Off"
@@ -629,6 +657,10 @@ msgstr "Sistema"
 msgid "Standard"
 msgstr "Padrão"
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "Stream the UI over Wi-Fi. Recording or display sleep pauses streaming. Anyone on the same network can view the stream."
+msgstr "Transmite a interface por Wi-Fi. A gravação ou a suspensão da tela pausa a transmissão. Qualquer pessoa na mesma rede pode assistir."
+
 #: openpilot/selfdrive/ui/onroad/alert_renderer.py
 msgid "System Unresponsive"
 msgstr "Sistema sem resposta"
@@ -641,6 +673,10 @@ msgstr "ASSUMA O CONTROLE IMEDIATAMENTE"
 msgid "TEMP"
 msgstr "TEMP."
 
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "TTL: 1 - 255. Use 1 for the local network."
+msgstr "TTL: 1 - 255. Use 1 para a rede local."
+
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Target Branch"
 msgstr "Branch Alvo"
@@ -652,6 +688,14 @@ msgstr "Senha Tethering"
 #: openpilot/selfdrive/ui/layouts/settings/settings.py
 msgid "Toggles"
 msgstr "Alternativas"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Port"
+msgstr "Porta UDP"
+
+#: openpilot/system/ui/widgets/screen_stream_settings.py
+msgid "UDP Screen Streaming"
+msgstr "Transmissão da tela por UDP"
 
 #: openpilot/selfdrive/ui/layouts/settings/developer.py
 msgid "UI Debug Mode"

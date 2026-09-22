@@ -4,10 +4,11 @@ from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.list_view import multiple_button_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
-from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.application import RECORD, gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.system.ui.widgets.screen_stream_settings import ScreenStreamSettings, STREAM_TITLE, STREAM_DESCRIPTION
 
 if gui_app.sunnypilot_ui():
   from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp as toggle_item
@@ -88,6 +89,12 @@ class TogglesLayout(Widget):
         "microphone.png",
         True,
       ),
+      "ScreenStreamEnabled": (
+        lambda: tr(STREAM_TITLE),
+        STREAM_DESCRIPTION,
+        "monitoring.png",
+        False,
+      ),
       "IsMetric": (
         lambda: tr("Use Metric System"),
         DESCRIPTIONS["IsMetric"],
@@ -107,6 +114,7 @@ class TogglesLayout(Widget):
     )
 
     self._toggles = {}
+    self._stream_settings = ScreenStreamSettings(self._params)
     self._locked_toggles = set()
     for param, (title, desc, icon, needs_restart) in self._toggle_defs.items():
       toggle = toggle_item(
@@ -140,11 +148,17 @@ class TogglesLayout(Widget):
         self._toggles["LongitudinalPersonality"] = self._long_personality_setting
 
     self._update_experimental_mode_icon()
-    self._scroller = Scroller(list(self._toggles.values()), line_separator=True, spacing=0)
+    items = []
+    for param, toggle in self._toggles.items():
+      items.append(toggle)
+      if param == "ScreenStreamEnabled":
+        items.extend(self._stream_settings.items.values())
+    self._scroller = Scroller(items, line_separator=True, spacing=0)
 
     ui_state.add_engaged_transition_callback(self._update_toggles)
 
   def _update_state(self):
+    self._stream_settings.refresh()
     if ui_state.sm.updated["selfdriveState"]:
       personality = PERSONALITY_TO_INT[ui_state.sm["selfdriveState"].personality]
       if personality != ui_state.personality and ui_state.started:
@@ -209,6 +223,9 @@ class TogglesLayout(Widget):
       if self._toggle_defs[toggle_def][3] and toggle_def not in self._locked_toggles:
         self._toggles[toggle_def].action_item.set_enabled(not ui_state.engaged)
 
+    self._toggles["ScreenStreamEnabled"].action_item.set_enabled(not RECORD)
+    self._stream_settings.refresh(force=True)
+
   def _render(self, rect):
     self._scroller.render(rect)
 
@@ -242,6 +259,8 @@ class TogglesLayout(Widget):
       return
 
     self._params.put_bool(param, state, block=True)
+    if param == "ScreenStreamEnabled":
+      self._stream_settings.refresh(force=True)
     if self._toggle_defs[param][3]:
       self._params.put_bool("OnroadCycleRequested", True, block=True)
 

@@ -6,6 +6,7 @@ from openpilot.cereal import messaging
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.common.realtime import Priority, config_realtime_process, set_core_affinity
 from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
 from openpilot.selfdrive.ui.layouts.main import MainLayout
 from openpilot.selfdrive.ui.mici.layouts.main import MiciMainLayout
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -19,6 +20,7 @@ def main():
   config_realtime_process(0, Priority.CTRL_HIGH)
 
   gui_app.init_window("UI")
+  gui_app.enable_screen_stream(lambda: ui_state.params.get_bool("ScreenStreamEnabled"), lambda: ScreenStreamConfig.from_params(ui_state.params))
   if BIG_UI:
     MainLayout()
   else:

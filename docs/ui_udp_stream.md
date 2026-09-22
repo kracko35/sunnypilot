@@ -28,7 +28,7 @@ git push origin udp-screen-streaming
 
 ## 実装
 
-- `system/ui/lib/screen_stream.py`: 接続Wi-Fiの取得、FFmpegプロセス管理、最新フレームの待ち行列、書き込み期限、再試行。`MpegTsMulticastSender`が標準出力の読み取り・TS分割・Python socketでの送信を担当する。
+- `system/ui/lib/screen_stream.py`: 接続Wi-Fiの取得、FFmpegプロセス管理、最新フレームの待ち行列、書き込み期限、再試行。`MpegTsUdpSender`が標準出力の読み取り・TS分割・Python socketでの送信を担当する。
 - `system/ui/lib/screen_capture.py`: 録画と共有するRGBA読み出し、GPUでの縮小、20fpsへの間引き。
 - `system/ui/lib/application.py`: 必要時のみRenderTextureを確保し、画面描画後に配信キャプチャを行う。`RECORD=1`の場合は配信ワーカーを起動しない。
 - `selfdrive/ui/ui.py`: 通常UIから配信機能を登録。他のGUIツールや録画専用ツールには配信を自動登録しない。
@@ -43,12 +43,12 @@ git push origin udp-screen-streaming
 
 | 英語UI | 永続キー | 既定値 | 入力範囲 |
 | --- | --- | --- | --- |
-| Multicast Address | `ScreenStreamAddress` | 239.255.42.99 | IPv4の224.0.1.0～239.255.255.255 |
+| Destination Address（送信先アドレス） | `ScreenStreamAddress` | 239.255.42.99 | 通常のIPv4 unicast、またはmulticastの224.0.1.0～239.255.255.255 |
 | UDP Port | `ScreenStreamPort` | 12346 | 1～65535 |
 | Bitrate (kbit/s) | `ScreenStreamBitrate` | 1500 | 250～8000 |
 | Multicast TTL | `ScreenStreamTtl` | 1 | 1～255 |
 
-アドレスはマルチキャスト専用で、ユニキャストIP・ホスト名・URL・224.0.0.0/24の制御用アドレスは受け付けない。TTLは同一ネットワーク内では1を使用する。設定は再起動後も保持し、OFFにしても値を消去しない。解像度800×480と最大20fpsは固定。
+アドレスは`192.168.4.44`、`10.0.0.20`などの通常のunicastと、従来のmulticastを受け付ける。0.0.0.0と0/8、127/8、link-local、予約済みIPv4、255.255.255.255、224.0.0/24、IPv6、ホスト名、URL、ポートやクエリ付き入力は拒否する。サブネットごとのdirected broadcast判定は行わないため、受信端末のホストアドレスを指定する。TTL欄は表示を維持し、説明にmulticast専用・unicastでは無視と明記する。TTLの保存範囲は従来どおり1～255で、multicastで同一ネットワークなら1を使う。既存Param名と既定値は変更しない。設定は再起動後も保持し、OFFにしても値を消去しない。解像度800×480と最大20fpsは固定。
 
 `screen_stream_config.py`の検証をUI入力と配信バックエンドで共用する。無効な入力は保存せず、翻訳されたエラーと入力範囲を表示して再入力を求める。キャンセル時は値を変更しない。設定は通常1秒周期のワーカー側チェックで反映し、変更時に古いFFmpeg・送信スレッド・socket・待機フレームを解放し、エンコーダと送信処理を再生成する。本体UIの再起動は不要。新しいキーを登録するため、この更新を初めて導入するときはネイティブライブラリの再ビルドが必要。
 
@@ -62,7 +62,7 @@ git push origin udp-screen-streaming
   └─ GPUで800×480へ縮小（縦横比保持・黒帯）
        └─ RGBA読み出し → 最新1フレーム → FFmpeg stdin
             → libx264 / MPEG-TS → stdout (pipe:1)
-            → 専用送信スレッド → Python socket → UDPマルチキャスト
+            → 専用送信スレッド → Python socket → UDPユニキャスト／マルチキャスト
 ```
 
 2160×1080のフル画面をCPUへ読み出す代わりに800×480で読み出す。20fps時の生RGBA転送量は約30.72 MB/sで、フル解像度の約186.62 MB/sより小さい。これは画素数からの計算で、実測値ではない。
@@ -73,7 +73,7 @@ OpenGLの上下方向は縮小描画時とFFmpegの`vflip`で揃える。FPS表�
 
 固定設定は800×480、最大20fps、libx264 baseline / yuv420p、Bフレームなし、GOP 10、`veryfast`、`zerolatency`。ビットレートは設定値を使い、VBVはその約1/3とする。SPS/PPSを繰り返し、MPEG-TSで送信する。既定値は1500 kbit/s、VBV 500 kbit、宛先`239.255.42.99:12346`、TTL 1。UDPペイロードはPython側で最大1316 bytesに制限する。FFmpeg URLの`pkt_size`オプションは使用しない。
 
-Wi-Fiの判定は、NetworkManagerの接続済みWi-Fiデバイス、インフラストラクチャモード、有効なIPv4の組み合わせで行う。デフォルトルートが携帯回線でもWi-Fiが接続済みなら配信できる。Pythonの`socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)`を使い、`IP_MULTICAST_IF`へWi-FiのIPv4を、`IP_MULTICAST_TTL`へ設定値を指定する。`bind`は使用しない。Wi-Fiインターフェース名・IPv4・宛先・ポート・ビットレート・TTLのいずれかが変われば、FFmpegとsocketを作り直す。
+Wi-Fiの判定は、NetworkManagerの接続済みWi-Fiデバイス、インフラストラクチャモード、有効なIPv4の組み合わせで行う。デフォルトルートが携帯回線でもWi-Fiが接続済みなら配信できる。宛先を`ipaddress.IPv4Address(config.address).is_multicast`で判定する。両方式とも`socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)`、非ブロッキング、`sendto(payload, (config.address, config.port))`を使い、`connect()`と`SO_BINDTODEVICE`は使わない。multicastは従来どおり`IP_MULTICAST_IF`へWi-Fi IPv4、`IP_MULTICAST_TTL`へ設定TTLを指定し、bindしない。unicastは`bind((local_address, 0))`で送信元Wi-Fi IPv4を指定し、multicast用のsocket optionを一切設定しない。unicastのIP TTLはOSの既定値を使う。Wi-Fiインターフェース名・IPv4・宛先・ポート・ビットレート・TTLのいずれかが変われば、FFmpegとsocketを作り直す。
 
 UIスレッドはFFmpegへ直接書かない。ワーカーが非ブロッキングパイプを使い、`FRAME_MAX_AGE=0.25`秒を超えた未送信フレームは単に破棄し、再起動しない。実際の書き込み開始時刻から`PIPE_WRITE_TIMEOUT=0.50`秒を設け、その期限を超過した場合に再起動する。待ち行列での待機時間をパイプの書き込み猶予から差し引かない。書きかけのrawvideoを途中で捨てて次フレームへ継ぎ足すことはしない。ワーカーのスケジューラとniceを変更した後にFFmpegと送信スレッドを生成し、UIのリアルタイム優先度を継承させない。エンコーダのスレッド数も2に制限する。
 
@@ -94,7 +94,7 @@ FFmpeg出力の変更後: pipe:1
 
 ワーカーはRGBAをstdinへ書き、別の送信スレッドがstdoutを常時読み出す。読み書きを同じスレッドで処理しないため、stdoutの満杯でエンコーダが停止し、stdin書き込みまで停止する循環待ちを防ぐ。stdoutとsocketは非ブロッキングで処理する。送信バッファの空きを待たず、一時障害のデータグラムは再送しない。
 
-読み取り境界とTSパケット境界は一致しない。読み取ったデータを一時バッファへ追記し、1316 bytes（188×7）ずつ順序どおり`sendto()`する。1316 bytes未満は次の読み取りへ保持し、正常EOF時だけ188 bytesの整数倍の残りを送信する。停止時の末尾と188 bytes未満の端数は破棄する。送信障害がない場合、完全なTSパケットに欠落・重複・並べ替えを加えない。500 kbit/sを一定に出力する場合の1316 bytes蓄積時間は理論上約21msだが、実際の出力が途切れれば蓄積待ちは長くなる。
+読み取り境界とTSパケット境界は一致しない。読み取ったデータを一時バッファへ追記し、1316 bytes（188×7）ずつ順序どおり`sendto()`する。1316 bytes未満は次の読み取りへ保持し、正常EOF時だけ188 bytesの整数倍の残りを送信する。停止時の末尾と188 bytes未満の端数は破棄する。送信障害がない場合、完全なTSパケットに欠落・重複・並べ替えを加えない。一定のTS出力に対する1316 bytes蓄積時間は500 kbit/sで約21ms、1500 kbit/sで約7msだが、これは最大時間の保証ではなく、実際の出力が途切れれば蓄積待ちは長くなる。
 
 一時的な送信エラー（`BlockingIOError`、`EAGAIN`、`EWOULDBLOCK`、`ENOBUFS`、`EINTR`、`TimeoutError`とWindowsの対応コード）は、そのデータグラムだけを破棄して送信を続行する。`datagrams_sent`、`datagrams_dropped`、`bytes_sent`を記録し、破棄の警告は初回と以後5秒間隔に集約する。`ENETDOWN`、`ENODEV`、`EADDRNOTAVAIL`などの致命的な障害は保持してワーカーへ通知し、元のerrnoと例外のreprをcloudlogへ出す。stdoutのEOFも停止として検出する。障害時はreadyを解除して送信停止を通知し、FFmpegをterminate、200msで終了しなければkillしてさらに200ms待つ。stdin/stdoutを閉じ、送信スレッドを最大500msでjoinし、socketとフレーム待ち行列を解放する。約3秒後に再試行する。消灯やOFFでも同じ後片付けを行い、点灯・ON時は自動再開する。
 
@@ -140,9 +140,11 @@ python -c 'from openpilot.common.params import Params; Params().put_bool("Screen
 
 OFFへ戻すには`True`を`False`へ変更する。ブランチのロールバックは、記録した元のブランチへ切り替え、サブモジュールを同期して再起動する。
 
-送信先アドレス・ポートを変更した場合は、以下の受信URLにも同じ値を指定する。
+multicastでは受信URLにも同じグループアドレス・ポートを指定する。unicastでは本体の送信先にPCのWi-Fi IPv4を設定し、PCは同じポートで待ち受ける。
 
 ## 実機での再起動診断
+
+現在の実機`9f0d5360e`ではPIDの周期的再起動は解消済み。利用者の集計は`sent=21536 dropped=0 bytes_sent=28341376`。一方、受信PCのPacket corrupt・H.264復号エラーと約1000msの遅延が残っている。以下の再起動原因の説明は解消済み問題の診断記録であり、今回もその対策を維持する。
 
 利用者からは、comma 3XからPCへH.264 Constrained Baseline / yuv420p / 800×480 / 20fpsの映像が届く一方で、受信側のTS破損・DTS順序エラーとFFmpeg PIDの周期的変化が報告されている。Wi-Fi tupleと設定は30回の照会で安定し、単独stdinベンチマークでは50フレーム中の最大書き込み時間が114.2msだった。実機cloudlogで、大半の再起動理由が`network query error: TimeoutError(...)`と判明した。複数のD-Bus往復で250msの共通期限を消費し、一時的な照会失敗でも正常な配信を停止していたことが主因である。UDP破棄ログは報告されておらず、実際のビットレート変更による再生成は正常な動作として区別する。
 
@@ -168,7 +170,7 @@ grep -R -a "screen stream UDP drops" /data/log 2>/dev/null | tail -20
 
 | ログ | 内容 |
 | --- | --- |
-| `screen stream started:` | PID、Wi-Fi tuple、宛先、ビットレート、TTL |
+| `screen stream started:` | PID、`mode=unicast/multicast`、Wi-Fi tuple、宛先、ビットレート、TTL（unicastでは未使用） |
 | `screen stream stopped:` | PID、終了コード、停止理由（`stream disabled`、`screen invisible`、`shutdown`など） |
 | `screen stream restart: ffmpeg exited` | FFmpeg自身の終了と終了コード |
 | `screen stream restart: frame pipe broken` | stdin破損、errno、終了コード、例外 |
@@ -189,18 +191,104 @@ grep -R -a "screen stream UDP drops" /data/log 2>/dev/null | tail -20
 
 古いフレームの破棄、一時的なUDP送信失敗、D-Bus照会の一時失敗ではFFmpegを再起動しない。ネットワーク・設定変更では送信側とエンコーダを再生成する。OFF・消灯では停止し、ON・点灯で再開する。
 
-パケット破棄は映像欠損として見える可能性がある。GOP 10 / 20fpsならIDRの間隔は約0.5秒だが、継続的な通信損失や受信側の状態によって復旧は遅れる。再起動抑制が実機で改善したかは、PID・理由ログ・破棄数と受信映像を合わせて確認する。
+パケット破棄は映像欠損として見える可能性がある。GOP 10 / 20fpsならIDRの間隔は約0.5秒だが、継続的な通信損失や受信側の状態によって復旧は遅れる。`9f0d5360e`で周期的再起動は解消しPID安定と報告されている。方式切替時の正常な再生成と、試験中の予期しない再起動を区別して記録する。
 
 照会失敗が長時間続く場合も最後に確認できたWi-Fi情報を保持するため、実際の切断やIP変更の検出が遅れる可能性がある。正常応答が戻れば結果を反映し、socket側の致命的障害は従来どおり別経路で検出する。接続中の変更検出は最大約5秒に照会所要時間が加わる。D-Bus照会はUIではなく配信ワーカーで行うため、その実行中は新しいRGBAフレームの書き込みが一時停止し得る。期限は1リクエストごとで、照会全体の固定上限ではない。
 
 ## 受信と切り分け
 
-PCでの最初の受信はREADMEのFFplayコマンドを使う。映像形式を調べる場合は以下を使用する。
+### 通常受信と低遅延テスト
+
+PCのWi-Fi IPv4を確認する（Windowsなら`ipconfig`）。以下は`192.168.4.44`の場合。受信側のFFplayにはUDPとH.264/MPEG-TS対応が必要。各コマンドは1行のままPowerShellでも実行できる。FFplayは一度に1プロセスだけ起動し、切替時は終了させる。
+
+| 方式 | commaのDestination Address | PCの受信URL |
+| --- | --- | --- |
+| A: multicast | `239.255.42.99` | `udp://239.255.42.99:12346?localaddr=192.168.4.44` |
+| B: unicast | `192.168.4.44` | `udp://0.0.0.0:12346` |
+
+`0.0.0.0`はPC側の待受URLだけに使い、本体の送信先には設定しない。multicastの`localaddr`もPC自身のWi-Fi IPv4であり、commaのIPではない。
+
+通常受信:
+
+```sh
+ffplay "udp://239.255.42.99:12346?localaddr=192.168.4.44"
+ffplay "udp://0.0.0.0:12346"
+```
+
+低遅延テスト:
+
+```sh
+ffplay -max_delay 0 -avioflags direct -fflags nobuffer -flags low_delay -framedrop -probesize 4096 -analyzeduration 0 "udp://239.255.42.99:12346?localaddr=192.168.4.44"
+ffplay -max_delay 0 -avioflags direct -fflags nobuffer -flags low_delay -framedrop -probesize 4096 -analyzeduration 0 "udp://0.0.0.0:12346"
+```
+
+特定インターフェースでのunicast待受には`udp://0.0.0.0:12346?localaddr=192.168.4.44`を使う。Windowsでも`udp://192.168.4.44:12346`を比較できるが、ビルド差を避けるため明示的な`localaddr`を基本とする。[FFmpegのUDP実装](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/udp.c)では受信時のローカルアドレスを解決してbindする。
+
+比較では`fifo_size`と`overrun_nonfatal`を指定せず、受信FIFOを既定値に戻す。スレッド対応ビルドの既定FIFOは188 bytes×7×4096で、容量は常にその分の遅延が生じることを意味しない。必要になった場合だけ別試験で変更する。[FFmpeg UDP仕様](https://ffmpeg.org/ffmpeg-protocols.html#udp)
+
+`avioflags=direct`はバッファリングを減らし、`fflags=nobuffer`は初期入力解析中のバッファリングを減らす。`max_delay`はmux/demuxの最大遅延をマイクロ秒で指定する。[FFmpeg形式オプション](https://ffmpeg.org/ffmpeg-formats.html#Format-Options)。`max_delay=0`でUDPの並べ替え待ちを無効化する説明は公式資料の[RTSP節](https://ffmpeg.org/ffmpeg-protocols.html#rtsp)にある。今回のraw MPEG-TS/UDPで同じ待ちが発生しているとは断定せず、効果を個別に測定する。これらは受信FIFOを一律に無効化する設定ではない。
+
+`probesize`はまず4096とし、32へ極端に下げない。映像が検出できない場合は通常受信へ戻して確認する。小さな解析量やフレーム破棄には、検出失敗・表示の欠落とのトレードオフがある。遅延短縮量は受信ビルドと表示環境を含む実測で判断する。
+
+### multicast / unicastのA/B試験
+
+1. commaとPCを同じWi-Fiへ接続する。機器位置、AP、PCの電源設定・表示リフレッシュレート、FFplayのバージョンを固定する。画面点灯を維持し、同じUI操作を繰り返す。
+2. commaで配信ON、800×480・20fps・GOP 10・B-frame 0のまま、ビットレートを500 kbit/sへ設定する。ポート12346、TTL 1とする。FFmpegのエンコード設定は変更しない。
+3. 配信ONの状態で送信先Aを保存してからOFFにする。受信側をAの通常受信で起動し、配信ONにする。`screen stream started`のmode・宛先・PIDを確認する。
+4. 起動から10秒をウォームアップとして区別し、その後5分間測定する。ログ・映像・時刻を保存して配信OFFにし、`screen stream sender stopped`の最終集計を記録する。集計にはウォームアップも含まれるため、全試験で時間を揃える。
+5. 受信側を終了し、送信先をBへ変更してBの通常受信で同じ試験を行う。方式切替に伴うPID変更は正常。各5分間の試験中のPID変化を別に数える。
+6. A/Bを最低3回繰り返し、順序も入れ替える。次にビットレートだけ1500 kbit/sへ戻し、同じA/Bを繰り返す。低遅延コマンドの比較は次節で受信条件を分離して行う。
+
+エラーを数える試験では、どちらのコマンドにも`-loglevel repeat+warning -nostats`を追加し、例えば末尾へ`2> A-500-1.log`を付ける。通常の重複ログ抑制で回数が見えなくなることを避ける。各試験名を方式・ビットレート・試行番号で揃える。PCのPowerShellでの集計例:
+
+```powershell
+@(Select-String -Path A-500-1.log -Pattern 'Packet corrupt').Count
+@(Select-String -Path A-500-1.log -Pattern 'error while decoding MB|corrupted macroblock').Count
+```
+
+これはログ行数であり、UDP欠落数や破損フレーム数ではない。別の復号エラーも原文を保存する。開始直後の途中参加によるエラーと継続的なエラーを区別し、毎回同じ集計期間を使う。
+
+| 条件（各3回） | Packet corrupt行数 | H.264エラー行数 | ブロックノイズ | 遅延中央値／最大ms | sender dropped | 試験中のPID変化 |
+| --- | --- | --- | --- | --- | --- | --- |
+| A multicast / 500 | 未測定 | 未測定 | 未確認 | 未測定 | 未測定 | 未確認 |
+| B unicast / 500 | 未測定 | 未測定 | 未確認 | 未測定 | 未測定 | 未確認 |
+| A multicast / 1500 | 未測定 | 未測定 | 未確認 | 未測定 | 未測定 | 未確認 |
+| B unicast / 1500 | 未測定 | 未測定 | 未確認 | 未測定 | 未測定 | 未確認 |
+
+unicastで破損が大幅に減れば、Wi-Fiのmulticast経路が主要因であることを強く示す。同程度なら送信タイミング・受信負荷・MPEG-TSをさらに調べる。senderの`dropped=0`はローカル送信APIで破棄がなかったという意味で、無線区間やPCの受信側で欠落がないことを保証しない。
+
+### 受信バッファと遅延の段階比較
+
+同じunicast送信と同じビットレートで、以下を1つずつ実行する。各試験は10秒のウォームアップ後に5分間行い、映像品質も同時に記録する。Test 1～4は`probesize=4096`と`analyzeduration=0`を共通にして追加オプションの効果を比較する。通常受信の既定解析量との差は別枠のTest 0として記録する。以前使用したコマンドも比較する場合は実際の引数をそのまま記録し、複数条件の変更を単一オプションの効果と混同しない。
+
+| 試験 | Test 1に追加するオプション | 遅延中央値／最大ms | 破損・目視品質 |
+| --- | --- | --- | --- |
+| Test 0: 通常受信 | 解析量も含め既定値 | 未測定 | 未確認 |
+| Test 1: 比較基準 | なし | 未測定 | 未確認 |
+| Test 2 | `-max_delay 0` | 未測定 | 未確認 |
+| Test 3 | 上記＋`-avioflags direct` | 未測定 | 未確認 |
+| Test 4 | 上記＋`-fflags nobuffer -flags low_delay -framedrop` | 未測定 | 未確認 |
+
+```sh
+ffplay "udp://0.0.0.0:12346"
+ffplay -probesize 4096 -analyzeduration 0 "udp://0.0.0.0:12346"
+ffplay -max_delay 0 -probesize 4096 -analyzeduration 0 "udp://0.0.0.0:12346"
+ffplay -max_delay 0 -avioflags direct -probesize 4096 -analyzeduration 0 "udp://0.0.0.0:12346"
+ffplay -max_delay 0 -avioflags direct -fflags nobuffer -flags low_delay -framedrop -probesize 4096 -analyzeduration 0 "udp://0.0.0.0:12346"
+```
+
+comma画面とPC画面を同時にスマートフォンの60fps以上の動画へ撮影する。停車状態で設定画面を開閉するなど、同じUI変化が本体とPCに現れたフレーム番号を読み取り、`(PC側フレーム番号 − 本体側フレーム番号) / 撮影fps × 1000`でmsへ換算する。60fpsで18フレーム差なら300ms。可変フレームレートの録画ではフレーム番号の代わりに動画の時刻を使う。
+
+各条件で10個以上の変化を測り、中央値・最大値・標本数・撮影fpsを記録する。60fpsの1フレームは約16.7msで、表示更新と読み取りにも誤差があるため、数ms単位の差を断定しない。PC時計とcomma時計の同期は不要。起動して最初の映像が出るまでの時間は定常時のglass-to-glass遅延と分ける。
+
+### 形式確認と受信できない場合
+
+映像形式を調べる場合は以下を使用する。`<PC_IP>`を実際のPCのIPv4へ置換する。
 
 ```sh
 ffprobe -v error -select_streams v:0 \
   -show_entries stream=codec_name,profile,width,height,pix_fmt,has_b_frames,r_frame_rate \
-  'udp://239.255.42.99:12346?fifo_size=256&overrun_nonfatal=1'
+  'udp://239.255.42.99:12346?localaddr=<PC_IP>'
 ```
 
 FFplayとFFprobeは必要に応じて一方ずつ実行する。受信できない場合は、両端のIPv4、APの端末間隔離、IGMP・マルチキャスト制限、受信側のファイアウォールとインターフェースを確認する。パケットが届いているのに黒画面ならFFmpegのH.264デコードと入力解析時間を確認し、まず`-analyzeduration 0`や`-fflags nobuffer`を外して切り分ける。
@@ -221,23 +309,24 @@ SCREEN_STREAM_TEST_GPU=1 python -m unittest \
   openpilot.system.ui.lib.tests.test_screen_stream_video -v
 ```
 
-GPU統合テストはOpenGLコンテキストとFFmpeg、ループバック上のUDPマルチキャストを必要とする。通常はスキップされる。FFmpegのパスを個別に指定する場合は`SCREEN_STREAM_TEST_FFMPEG`を使用する。エンコーダには`-protocol_whitelist file,pipe`を指定し、FFmpegのUDP対応に依存しないことを確認する。GPU→FFmpeg stdout→本番のPython送信クラス→ループバック受信→復号の経路で、合成した赤青の画像だけをPC内で送受信し、本物のUIやカメラ映像は使わない。
+GPU統合テストはOpenGLコンテキストとFFmpeg、ループバック上のUDP multicast/unicastを必要とする。unicastの127.0.0.1は送信クラスを直接検証するテスト用オブジェクトだけに使い、本番設定の検証は引き続き拒否する。通常はスキップされる。FFmpegのパスを個別に指定する場合は`SCREEN_STREAM_TEST_FFMPEG`を使用する。エンコーダには`-protocol_whitelist file,pipe`を指定し、FFmpegのUDP対応に依存しないことを確認する。GPU→FFmpeg stdout→本番のPython送信クラス→ループバック受信→復号の経路で、合成した赤青の画像だけをPC内で送受信し、本物のUIやカメラ映像は使わない。
 
 2026-09-22の開発PCでの結果:
 
-- Python 3.12、Windows、Raylib 6.1-dev、FFmpeg 7.1で単体テスト61件とGPU統合テスト2件が成功。
+- Python 3.12、Windows、Raylib 6.1-dev、FFmpeg 7.1で単体テスト65件とGPU統合テスト3件が成功。
 - D-Bus照会失敗時の既存プロセス維持、100回連続失敗での警告集約、起動前の待機、正常な未接続・tuple変更、設定確認の独立性、不正設定のままWi-Fi検出に成功しても起動しないこと、各D-Busリクエストの独立した期限を検証。
 - 不規則なstdout読み取り境界からの1316 bytes集約、正常EOFの端数送信、不完全なTS端数破棄、socket設定、致命的障害の通知、送信スレッド終了を確認。
 - EAGAIN・ENOBUFS・EINTRなどの注入で送信継続とFFmpegの維持、破棄数・成功数・送信bytesを確認。100回の破棄で警告が100回出ないことを検証。
 - フレーム鮮度と書き込み期限の分離、古いフレームだけの破棄、実際のパイプ停止による再起動、原因別cloudlogメッセージと再起動回数を検証。
 - 無効時の無通信、最新フレームへの置き換え、Wi-Fi切断・再接続・IP変更、D-Bus障害、FFmpeg欠落・終了・書き込み停止からの復旧を確認。
-- GPU縮小・上下方向・黒帯、H.264 Constrained Baseline / 800×480 / 20fps / yuv420p / Bフレームなし、188 bytes単位のMPEG-TS、最大1316 bytesの実UDPマルチキャスト送受信と復号を確認。
+- GPU縮小・上下方向・黒帯、H.264 Constrained Baseline / 800×480 / 20fps / yuv420p / Bフレームなし、188 bytes単位のMPEG-TS、最大1316 bytesの実UDP multicast/unicast送受信と復号を確認。
 - Ruffによる変更Pythonファイルの検査を実施。
-- 既定値に加え、別のアドレス・ポート・2600 kbit/s・TTL 2でもGPU→FFmpeg stdout→Python socket→UDP→復号を確認。
+- 既定値に加え、別multicastアドレス・ポート・2600 kbit/s・TTL 2と、unicastループバック・500 kbit/sでもGPU→FFmpeg stdout→Python socket→UDP→復号を確認。
+- 両方式のsocket設定・sendto宛先・1316 bytes集約・一時／致命的エラー、unicastのbind失敗時解放、TTL無視、方式切替両方向での後片付けと再生成を検証。
 - 設定の境界値・不正値・URL文字列拒否・保存とキャンセル・録画中の編集無効化・OFF時の非表示・送信先変更時の再起動を確認。
 - 本家のPOローダーで12言語の翻訳収録を確認し、英語から日本語への切替と表示更新を検証。
 
-実機からはParamsの保存値とWi-Fi検出（wlan0）が正常で、標準FFmpegのUDP非対応によりエンコーダが即終了することが報告されている。その後、Python socket経由のPC受信成功と周期的なFFmpeg再起動が報告されている。本修正後の実機での再起動抑制と破棄率は未確認。開発PCの結果はcomma 3Xでの実測・本体ビルド・本家CI全体の成功を意味しない。Windowsには本家のLinuxネイティブ依存が揃わないため、本体UI全体の起動テストは未実施。Windowsテストではswaglogのネイティブ依存をモックへ差し替え、cloudlogへ渡すメッセージを検証する。実機で既存cloudlogが保存されることは報告済み。本修正後の照会ログとPID維持は引き続き実機確認が必要。
+実機ではPython socket経由のPC受信と`9f0d5360e`でのPID安定・local drop 0件が報告済み。今回のunicastと受信オプションによる破損・遅延の改善は未測定。開発PCの結果はcomma 3Xでの本体ビルド・本体UI全体・本家CI全体の成功を意味しない。Windowsテストではswaglogのネイティブ依存をモックへ差し替え、cloudlogへ渡すメッセージを検証する。実機で既存cloudlogが保存されることは報告済み。
 
 ## 実機テスト記録
 

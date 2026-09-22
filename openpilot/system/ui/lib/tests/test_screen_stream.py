@@ -35,7 +35,7 @@ class TestScreenStreamer(unittest.TestCase):
     self.processes = []
     self.commands = []
     self.senders = []
-    self.sender_class = stream.MpegTsMulticastSender
+    self.sender_class = stream.MpegTsUdpSender
     self.stdout_factory = Mock
     log_patch = patch.object(stream, 'cloudlog')
     self.cloudlog = log_patch.start()
@@ -47,6 +47,7 @@ class TestScreenStreamer(unittest.TestCase):
       transport.done.is_set.return_value = False
       transport.error = None
       transport.arguments = args
+      transport.mode = 'multicast' if stream.ipaddress.IPv4Address(args[2].address).is_multicast else 'unicast'
       self.senders.append(transport)
       return transport
 
@@ -60,7 +61,7 @@ class TestScreenStreamer(unittest.TestCase):
       return proc
 
     for target, kwargs in [
-      ('subprocess.Popen', {'side_effect': process}), ('MpegTsMulticastSender', {'side_effect': sender}),
+      ('subprocess.Popen', {'side_effect': process}), ('MpegTsUdpSender', {'side_effect': sender}),
       ('os.set_blocking', {'side_effect': lambda fd, blocking: None if fd == 42 else set_blocking(fd, blocking)}),
       ('select.select', {'return_value': ([], [], [])}),
       ('CONFIG_INTERVAL', {'new': 0.02}), ('NETWORK_INTERVAL_CONNECTED', {'new': 0.02}),
@@ -114,6 +115,24 @@ class TestScreenStreamer(unittest.TestCase):
     self.config.side_effect = None
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
     self.assertIn('screen stream restart: invalid config:', self.log_messages())
+
+  def test_switches_between_unicast_and_multicast_with_clean_restart(self):
+    self.enabled = True
+    self.streamer.start()
+    wait_until(self.streamer.ready.is_set)
+    for index, address in enumerate(['192.168.4.44', '239.255.42.99'], start=1):
+      self.config.return_value = replace(self.config.return_value, address=address)
+      wait_until(lambda expected=index + 1: len(self.processes) == expected and self.streamer.ready.is_set())
+      self.processes[index - 1].terminate.assert_called_once()
+      self.processes[index - 1].stdin.close.assert_called_once()
+      self.processes[index - 1].stdout.close.assert_called_once()
+      self.senders[index - 1].stop.assert_called_once()
+      self.senders[index - 1].close.assert_called_once()
+      self.assertEqual(self.senders[index].arguments[2].address, address)
+      self.assertEqual(self.commands[index], self.commands[0])
+    self.assertIn('mode=unicast', self.log_messages())
+    self.assertIn('mode=multicast', self.log_messages())
+    self.assertEqual(self.streamer._restart_count, 0)
 
   def test_settings_saved_while_disabled_apply_on_enable(self):
     self.config.return_value = ScreenStreamConfig(port=23456)
@@ -339,7 +358,7 @@ class TestScreenStreamer(unittest.TestCase):
 
     self.stdout_factory = stdout
     self.enabled = True
-    with patch.object(stream, 'MpegTsMulticastSender', side_effect=sender), patch.object(stream.socket, 'socket', side_effect=socket):
+    with patch.object(stream, 'MpegTsUdpSender', side_effect=sender), patch.object(stream.socket, 'socket', side_effect=socket):
       try:
         self.streamer.start()
         yield writers, transports, sockets
@@ -591,7 +610,7 @@ class TestCommand(unittest.TestCase):
       self.assertEqual(command[command.index(flag) + 1], value)
 
 
-class TestMpegTsMulticastSender(unittest.TestCase):
+class TestMpegTsUdpSender(unittest.TestCase):
   def setUp(self):
     log_patch = patch.object(stream, 'cloudlog')
     self.cloudlog = log_patch.start()
@@ -602,7 +621,7 @@ class TestMpegTsMulticastSender(unittest.TestCase):
     sock.sendto.side_effect = lambda payload, destination: len(payload)
     with patch.object(stream.socket, 'socket', return_value=sock) as create, \
          patch.object(stream.os, 'set_blocking'), patch.object(stream.os, 'read', side_effect=[*chunks, b'']):
-      sender = stream.MpegTsMulticastSender(Mock(), '192.168.4.38', config)
+      sender = stream.MpegTsUdpSender(Mock(), '192.168.4.38', config)
       sender.start()
       try:
         self.assertTrue(sender.done.wait(2))
@@ -611,9 +630,17 @@ class TestMpegTsMulticastSender(unittest.TestCase):
       self.assertIsNone(sender.error)
       self.assertFalse(sender._thread.is_alive())
     create.assert_called_once_with(stream.socket.AF_INET, stream.socket.SOCK_DGRAM, stream.socket.IPPROTO_UDP)
-    sock.setsockopt.assert_any_call(stream.socket.IPPROTO_IP, stream.socket.IP_MULTICAST_IF, stream.socket.inet_aton('192.168.4.38'))
-    sock.setsockopt.assert_any_call(stream.socket.IPPROTO_IP, stream.socket.IP_MULTICAST_TTL, config.ttl)
-    sock.bind.assert_not_called()
+    if stream.ipaddress.IPv4Address(config.address).is_multicast:
+      self.assertEqual(sender.mode, 'multicast')
+      sock.setsockopt.assert_any_call(stream.socket.IPPROTO_IP, stream.socket.IP_MULTICAST_IF, stream.socket.inet_aton('192.168.4.38'))
+      sock.setsockopt.assert_any_call(stream.socket.IPPROTO_IP, stream.socket.IP_MULTICAST_TTL, config.ttl)
+      self.assertEqual(sock.setsockopt.call_count, 2)
+      sock.bind.assert_not_called()
+    else:
+      self.assertEqual(sender.mode, 'unicast')
+      sock.bind.assert_called_once_with(('192.168.4.38', 0))
+      sock.setsockopt.assert_not_called()
+    sock.connect.assert_not_called()
     sock.setblocking.assert_called_once_with(False)
     sock.settimeout.assert_not_called()
     sock.close.assert_called()
@@ -634,20 +661,39 @@ class TestMpegTsMulticastSender(unittest.TestCase):
       size = sizes[len(chunks) % len(sizes)]
       chunks.append(ts[offset:offset + size])
       offset += size
-    self.assertEqual(self.run_sender(chunks, ScreenStreamConfig('239.10.20.30', 15000, 3000, 2)), ts)
+    for address in ['239.10.20.30', '192.168.4.44']:
+      with self.subTest(address=address):
+        self.assertEqual(self.run_sender(chunks, ScreenStreamConfig(address, 15000, 3000, 2)), ts)
+
+  def test_unicast_ignores_multicast_ttl(self):
+    for ttl in [1, 255]:
+      with self.subTest(ttl=ttl):
+        config = ScreenStreamConfig('10.0.0.20', 12346, 1500, ttl)
+        self.assertEqual(self.run_sender([b'A' * 1316], config), b'A' * 1316)
+        self.assertEqual(stream.ffmpeg_command(config), stream.ffmpeg_command())
+
+  def test_unicast_bind_failure_closes_socket(self):
+    with patch.object(stream.socket, 'socket') as create:
+      create.return_value.bind.side_effect = OSError(errno.EADDRNOTAVAIL, '送信元アドレス消失')
+      self.assertRaises(OSError, stream.MpegTsUdpSender, Mock(), '192.168.4.38', ScreenStreamConfig('192.168.4.44'))
+      create.return_value.close.assert_called_once()
+      create.return_value.setsockopt.assert_not_called()
 
   def test_eof_drops_only_incomplete_packet(self):
-    ts = b'\x47' * (188 * 9)
-    for tail in [b'', b'X', b'X' * 187]:
-      with self.subTest(tail=len(tail)):
-        self.assertEqual(self.run_sender([ts + tail]), ts)
-    self.assertEqual(self.run_sender([b'X' * 187]), b'')
+    for address in ['239.255.42.99', '192.168.4.44']:
+      with self.subTest(address=address):
+        config = ScreenStreamConfig(address)
+        ts = b'\x47' * (188 * 9)
+        for tail in [b'', b'X', b'X' * 187]:
+          with self.subTest(tail=len(tail)):
+            self.assertEqual(self.run_sender([ts + tail], config), ts)
+        self.assertEqual(self.run_sender([b'X' * 187], config), b'')
 
   def test_idle_stdout_close_is_bounded(self):
     read_fd, write_fd = os.pipe()
     self.addCleanup(os.close, write_fd)
     with os.fdopen(read_fd, 'rb', buffering=0) as stdout, patch.object(stream.socket, 'socket') as create:
-      sender = stream.MpegTsMulticastSender(stdout, '127.0.0.1', ScreenStreamConfig())
+      sender = stream.MpegTsUdpSender(stdout, '127.0.0.1', ScreenStreamConfig())
       sender.start()
       start = time.monotonic()
       sender.close()
@@ -659,7 +705,7 @@ class TestMpegTsMulticastSender(unittest.TestCase):
   def test_socket_setup_failure_closes_socket(self):
     with patch.object(stream.socket, 'socket') as create:
       create.return_value.setsockopt.side_effect = OSError('インターフェース消失')
-      self.assertRaises(OSError, stream.MpegTsMulticastSender, Mock(), '192.168.4.38', ScreenStreamConfig())
+      self.assertRaises(OSError, stream.MpegTsUdpSender, Mock(), '192.168.4.38', ScreenStreamConfig())
       create.return_value.close.assert_called_once()
 
   def test_coalesces_until_full_and_does_not_flush_on_stop(self):
@@ -667,7 +713,7 @@ class TestMpegTsMulticastSender(unittest.TestCase):
     self.addCleanup(os.close, write_fd)
     with os.fdopen(read_fd, 'rb', buffering=0) as stdout, patch.object(stream.socket, 'socket') as create:
       create.return_value.sendto.side_effect = lambda payload, destination: len(payload)
-      sender = stream.MpegTsMulticastSender(stdout, '127.0.0.1', ScreenStreamConfig())
+      sender = stream.MpegTsUdpSender(stdout, '127.0.0.1', ScreenStreamConfig())
       sender.start()
       try:
         os.write(write_fd, b'A' * 188)
@@ -683,24 +729,27 @@ class TestMpegTsMulticastSender(unittest.TestCase):
       self.assertEqual(sender.datagrams_sent, 1)
 
   def test_transient_drop_removes_exactly_one_datagram(self):
-    payloads = [bytes([i]) * 1316 for i in range(3)]
-    with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'), \
-         patch.object(stream.os, 'read', side_effect=[b''.join(payloads), b'']):
-      create.return_value.sendto.side_effect = [1316, OSError(errno.ENOBUFS, '送信バッファ不足'), 1316]
-      sender = stream.MpegTsMulticastSender(Mock(), '127.0.0.1', ScreenStreamConfig())
-      sender.start()
-      try:
-        self.assertTrue(sender.done.wait(2))
-      finally:
-        sender.close()
-      self.assertIsNone(sender.error)
-      self.assertEqual([call.args[0] for call in create.return_value.sendto.call_args_list], payloads)
-      self.assertEqual((sender.datagrams_sent, sender.datagrams_dropped, sender.bytes_sent), (2, 1, 2632))
+    for address in ['239.255.42.99', '192.168.4.44']:
+      with self.subTest(address=address):
+        config = ScreenStreamConfig(address)
+        payloads = [bytes([i]) * 1316 for i in range(3)]
+        with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'), \
+             patch.object(stream.os, 'read', side_effect=[b''.join(payloads), b'']):
+          create.return_value.sendto.side_effect = [1316, OSError(errno.ENOBUFS, '送信バッファ不足'), 1316]
+          sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', config)
+          sender.start()
+          try:
+            self.assertTrue(sender.done.wait(2))
+          finally:
+            sender.close()
+          self.assertIsNone(sender.error)
+          self.assertEqual([call.args[0] for call in create.return_value.sendto.call_args_list], payloads)
+          self.assertEqual((sender.datagrams_sent, sender.datagrams_dropped, sender.bytes_sent), (2, 1, 2632))
 
   def test_drop_warning_is_aggregated_and_rate_limited(self):
     with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'):
       create.return_value.sendto.side_effect = OSError(errno.ENOBUFS, '送信バッファ不足')
-      sender = stream.MpegTsMulticastSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', ScreenStreamConfig())
       try:
         with patch.object(stream.time, 'monotonic', return_value=1.0):
           for _ in range(100):
@@ -716,35 +765,41 @@ class TestMpegTsMulticastSender(unittest.TestCase):
         sender.close()
 
   def test_platform_transient_errnos_and_fatal_errors(self):
-    with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'):
-      sender = stream.MpegTsMulticastSender(Mock(), '127.0.0.1', ScreenStreamConfig())
-      try:
-        for code in stream.TRANSIENT_SEND_ERRNOS:
-          create.return_value.sendto.side_effect = OSError(code, '一時障害')
-          self.assertFalse(sender._send_datagram(bytes(1316)))
-        for code in [errno.ENETDOWN, errno.ENODEV, errno.EADDRNOTAVAIL]:
-          error = OSError(code, '致命的な障害')
-          create.return_value.sendto.side_effect = error
-          with self.assertRaises(OSError) as caught:
-            sender._send_datagram(bytes(1316))
-          self.assertIs(caught.exception, error)
-      finally:
-        sender.close()
+    for address in ['239.255.42.99', '192.168.4.44']:
+      with self.subTest(address=address):
+        config = ScreenStreamConfig(address)
+        with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'):
+          sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', config)
+          try:
+            for code in stream.TRANSIENT_SEND_ERRNOS:
+              create.return_value.sendto.side_effect = OSError(code, '一時障害')
+              self.assertFalse(sender._send_datagram(bytes(1316)))
+            for code in [errno.ENETDOWN, errno.ENODEV, errno.EADDRNOTAVAIL]:
+              error = OSError(code, '致命的な障害')
+              create.return_value.sendto.side_effect = error
+              with self.assertRaises(OSError) as caught:
+                sender._send_datagram(bytes(1316))
+              self.assertIs(caught.exception, error)
+          finally:
+            sender.close()
 
   def test_fatal_socket_and_read_error_are_reported(self):
-    for read_error in [False, True]:
-      with self.subTest(read_error=read_error), patch.object(stream.socket, 'socket') as create, \
-           patch.object(stream.os, 'set_blocking'), patch.object(stream.os, 'read') as read:
-        read.side_effect = OSError('パイプ障害') if read_error else [b'\x47' * 1316]
-        create.return_value.sendto.side_effect = OSError(errno.ENETDOWN, 'ネットワーク停止')
-        sender = stream.MpegTsMulticastSender(Mock(), '192.168.4.38', ScreenStreamConfig())
-        sender.start()
-        try:
-          self.assertTrue(sender.done.wait(2))
-        finally:
-          sender.close()
-        self.assertIsInstance(sender.error, OSError)
-        create.return_value.close.assert_called()
+    for address in ['239.255.42.99', '192.168.4.44']:
+      with self.subTest(address=address):
+        config = ScreenStreamConfig(address)
+        for read_error in [False, True]:
+          with self.subTest(read_error=read_error), patch.object(stream.socket, 'socket') as create, \
+               patch.object(stream.os, 'set_blocking'), patch.object(stream.os, 'read') as read:
+            read.side_effect = OSError('パイプ障害') if read_error else [b'\x47' * 1316]
+            create.return_value.sendto.side_effect = OSError(errno.ENETDOWN, 'ネットワーク停止')
+            sender = stream.MpegTsUdpSender(Mock(), '192.168.4.38', config)
+            sender.start()
+            try:
+              self.assertTrue(sender.done.wait(2))
+            finally:
+              sender.close()
+            self.assertIsInstance(sender.error, OSError)
+            create.return_value.close.assert_called()
 
 
 class TestStreamConfig(unittest.TestCase):
@@ -757,15 +812,16 @@ class TestStreamConfig(unittest.TestCase):
     self.assertEqual(ScreenStreamConfig.from_params(params), ScreenStreamConfig('239.10.20.30', 1234, 2500, 2))
 
   def test_accepts_boundaries_and_normalizes_whitespace(self):
-    for field, values in {'address': ['224.0.1.0', '239.255.255.255'], 'port': ['1', '65535'],
+    for field, values in {'address': ['192.168.4.44', '10.0.0.20', '224.0.1.0', '239.255.255.255'], 'port': ['1', '65535'],
                           'bitrate': ['250', '8000'], 'ttl': ['1', '255']}.items():
       for value in values:
         with self.subTest(field=field, value=value):
           self.assertEqual(str(parse_stream_setting(field, ' ' + value + ' ')), value)
 
   def test_rejects_invalid_addresses_and_url_injection(self):
-    for address in ['127.0.0.1', '192.168.1.20', '224.0.0.1', '240.0.0.1', '255.255.255.255', 'ff02::1',
-                    '239.1.2.3:1234', '239.1.2.3?ttl=255', 'example.com', '']:
+    for address in ['0.0.0.0', '0.1.2.3', '127.0.0.1', '127.255.255.254', '169.254.1.2', '224.0.0.1',
+                    '240.0.0.1', '255.255.255.255', 'ff02::1', '::1', 'udp://192.168.4.44', '192.168.4.44:12346',
+                    '192.168.4.44?ttl=255', '239.1.2.3:1234', '239.1.2.3?ttl=255', 'example.com', '']:
       with self.subTest(address=address):
         self.assertRaises(ValueError, parse_stream_setting, 'address', address)
 
@@ -776,7 +832,7 @@ class TestStreamConfig(unittest.TestCase):
           self.assertRaises(ValueError, parse_stream_setting, field, value)
 
   def test_saved_invalid_settings_are_not_silently_sent(self):
-    for values in [{'port': True}, {'ttl': 0}, {'bitrate': '3000'}, {'address': '192.168.1.10'}]:
+    for values in [{'port': True}, {'ttl': 0}, {'bitrate': '3000'}, {'address': '0.0.0.0'}]:
       with self.subTest(values=values):
         self.assertRaises(ValueError, ScreenStreamConfig, **values)
 

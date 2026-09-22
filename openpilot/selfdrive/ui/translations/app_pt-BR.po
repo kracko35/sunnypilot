@@ -371,8 +371,8 @@ msgid "IP Address"
 msgstr "Endereço IP"
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
-msgid "IPv4 multicast address (224.0.1.0 - 239.255.255.255)."
-msgstr "Endereço IPv4 multicast (224.0.1.0 - 239.255.255.255)."
+msgid "IPv4 unicast or multicast destination. No hostnames or URLs."
+msgstr "Destino IPv4 unicast ou multicast. Nomes de host e URLs não são aceitos."
 
 #: system/ui/sunnypilot/widgets/sunnylink_pairing_dialog.py
 msgid "If sponsorship status was not updated, please contact a moderator on the community forum at https://community.sunnypilot.ai"
@@ -419,8 +419,8 @@ msgid "Maximize your training data uploads to improve openpilot's driving models
 msgstr "Maximize seus envios de dados de treinamento para melhorar os modelos de condução do openpilot."
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
-msgid "Multicast Address"
-msgstr "Endereço multicast"
+msgid "Destination Address"
+msgstr "Endereço de destino"
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
 msgid "Multicast TTL"
@@ -674,8 +674,8 @@ msgid "TEMP"
 msgstr "TEMP."
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
-msgid "TTL: 1 - 255. Use 1 for the local network."
-msgstr "TTL: 1 - 255. Use 1 para a rede local."
+msgid "TTL: 1 - 255. Multicast only; ignored for unicast."
+msgstr "TTL: 1–255. Somente multicast; ignorado em unicast."
 
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Target Branch"

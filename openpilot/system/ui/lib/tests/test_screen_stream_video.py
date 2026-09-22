@@ -7,6 +7,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
@@ -25,7 +26,10 @@ class TestScreenStreamVideo(unittest.TestCase):
   def test_custom_destination_and_bitrate(self):
     self._check_stream(ScreenStreamConfig('239.255.42.100', 12347, 2600, 2))
 
-  def _check_stream(self, config):
+  def test_unicast_loopback_at_500_kbit(self):
+    self._check_stream(ScreenStreamConfig('192.168.4.44', 12348, 500, 1), loopback_unicast=True)
+
+  def _check_stream(self, config, loopback_unicast=False):
     import pyray as rl
     from openpilot.system.ui.lib.screen_capture import ScreenStreamCapture
 
@@ -87,12 +91,15 @@ class TestScreenStreamVideo(unittest.TestCase):
       # 本番のPython送信クラスを使い、FFmpegのstdoutからループバックへ送信する。
       packets = []
       stopped = threading.Event()
+      # ループバック宛先は送信クラスの統合テスト専用。本番の設定検証では引き続き拒否する。
+      transport_config = SimpleNamespace(**(vars(config) | {'address': '127.0.0.1'})) if loopback_unicast else config
       with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as receiver:
         receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-        receiver.bind(('', config.port))
-        receiver.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                            socket.inet_aton(config.address) + socket.inet_aton('127.0.0.1'))
+        receiver.bind(('127.0.0.1' if loopback_unicast else '', config.port))
+        if not loopback_unicast:
+          receiver.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                              socket.inet_aton(config.address) + socket.inet_aton('127.0.0.1'))
         receiver.settimeout(0.1)
 
         def receive():
@@ -108,7 +115,8 @@ class TestScreenStreamVideo(unittest.TestCase):
         try:
           with tempfile.TemporaryFile() as stderr:
             proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, bufsize=0)
-            sender = stream.MpegTsMulticastSender(proc.stdout, '127.0.0.1', config)
+            sender = stream.MpegTsUdpSender(proc.stdout, '127.0.0.1', transport_config)
+            self.assertEqual(sender.mode, 'unicast' if loopback_unicast else 'multicast')
             writer_errors = []
 
             def write_frames():
@@ -152,7 +160,7 @@ class TestScreenStreamVideo(unittest.TestCase):
           stopped.set()
           reader.join(timeout=2)
         self.assertFalse(reader.is_alive())
-      self.assertTrue(packets, 'UDPマルチキャストを受信できませんでした')
+      self.assertTrue(packets, 'UDPを受信できませんでした')
       self.assertTrue(all(len(packet) <= 1316 and len(packet) % 188 == 0 for packet in packets))
       self.assertTrue(all(len(packet) == 1316 for packet in packets[:-1]))
       self.assertEqual(sender.datagrams_dropped, 0)

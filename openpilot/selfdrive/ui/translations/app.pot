@@ -878,7 +878,7 @@ msgid "Bitrate: 250 - 8000 kbit/s."
 msgstr ""
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
-msgid "IPv4 multicast address (224.0.1.0 - 239.255.255.255)."
+msgid "IPv4 unicast or multicast destination. No hostnames or URLs."
 msgstr ""
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
@@ -886,7 +886,7 @@ msgid "Invalid value"
 msgstr ""
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
-msgid "Multicast Address"
+msgid "Destination Address"
 msgstr ""
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
@@ -902,7 +902,7 @@ msgid "Stream the UI over Wi-Fi. Recording or display sleep pauses streaming. An
 msgstr ""
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py
-msgid "TTL: 1 - 255. Use 1 for the local network."
+msgid "TTL: 1 - 255. Multicast only; ignored for unicast."
 msgstr ""
 
 #: openpilot/system/ui/widgets/screen_stream_settings.py

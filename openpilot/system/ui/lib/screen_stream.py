@@ -105,11 +105,12 @@ def ffmpeg_command(config: ScreenStreamConfig = DEFAULT_CONFIG) -> list[str]:
   ]
 
 
-class MpegTsMulticastSender:
+class MpegTsUdpSender:
   """FFmpegのstdoutを専用スレッドで読み、TS境界を保ってWi-Fiへ送信する。"""
   def __init__(self, stdout: BinaryIO, local_address: str, config: ScreenStreamConfig):
     self._stdout = stdout
     self._destination = (config.address, config.port)
+    self.mode = 'multicast' if ipaddress.IPv4Address(config.address).is_multicast else 'unicast'
     self._stop = threading.Event()
     self.done = threading.Event()
     self.error: Exception | None = None
@@ -117,11 +118,15 @@ class MpegTsMulticastSender:
     self.datagrams_dropped = 0
     self.bytes_sent = 0
     self._last_drop_log: float | None = None
-    self._thread = threading.Thread(target=self._run, name="ui-screen-multicast", daemon=True)
+    self._thread = threading.Thread(target=self._run, name="ui-screen-udp", daemon=True)
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
-      self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_address))
-      self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, config.ttl)
+      if self.mode == 'multicast':
+        self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_address))
+        self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, config.ttl)
+      else:
+        # ユニキャストも送信元をWi-Fiへ固定する。TTL設定はマルチキャストだけに適用する。
+        self._socket.bind((local_address, 0))
       self._socket.setblocking(False)
       os.set_blocking(stdout.fileno(), False)
     except Exception:
@@ -200,7 +205,7 @@ class ScreenStreamer:
     self._stop = threading.Event()
     self._thread = threading.Thread(target=self._run, name="ui-screen-stream", daemon=True)
     self._proc: subprocess.Popen | None = None
-    self._sender: MpegTsMulticastSender | None = None
+    self._sender: MpegTsUdpSender | None = None
     self._restart_count = 0
     self._network_query_failures = 0
     self._last_network_error_log: float | None = None
@@ -395,11 +400,11 @@ class ScreenStreamer:
             assert self._proc.stdin is not None and self._proc.stdout is not None
             os.set_blocking(self._proc.stdin.fileno(), False)
             try:
-              self._sender = MpegTsMulticastSender(self._proc.stdout, current_network[1], current_config)
+              self._sender = MpegTsUdpSender(self._proc.stdout, current_network[1], current_config)
             except OSError as error:
               raise SenderFatalError(f"sender fatal error during setup: errno={error.errno} error={error!r}") from error
             self._sender.start()
-            cloudlog.info(f"screen stream started: pid={self._proc.pid} network={current_network!r} " +
+            cloudlog.info(f"screen stream started: pid={self._proc.pid} mode={self._sender.mode} network={current_network!r} " +
                           f"destination={current_config.address}:{current_config.port} bitrate={current_config.bitrate} ttl={current_config.ttl}")
             self.ready.set()
           try:

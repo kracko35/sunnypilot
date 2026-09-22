@@ -24,8 +24,9 @@ class ScreenStreamConfig:
 
   def __post_init__(self):
     address = ipaddress.IPv4Address(self.address)
-    if not address.is_multicast or int(address) < int(ipaddress.IPv4Address('224.0.1.0')):
-      raise ValueError('宛先には224.0.1.0～239.255.255.255のマルチキャストIPv4を指定してください')
+    if (address.is_unspecified or address.is_loopback or address.is_link_local or address.is_reserved or int(address) >> 24 == 0
+        or (address.is_multicast and int(address) < int(ipaddress.IPv4Address('224.0.1.0')))):
+      raise ValueError('宛先には通常のユニキャストIPv4または224.0.1.0～239.255.255.255のマルチキャストIPv4を指定してください')
     for value, minimum, maximum in [(self.port, 1, 65535), (self.bitrate, 250, 8000), (self.ttl, 1, 255)]:
       if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError('画面配信の数値設定が範囲外です')

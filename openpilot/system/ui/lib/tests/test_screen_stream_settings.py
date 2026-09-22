@@ -120,6 +120,16 @@ class TestScreenStreamSettings(unittest.TestCase):
       edit.assert_called_once_with('port', invalid=True)
     self.assertEqual(self.params.values['ScreenStreamPort'], 12346)
 
+  def test_both_layouts_save_unicast_and_multicast_destinations(self):
+    self.params.values['ScreenStreamEnabled'] = True
+    for compact in [False, True]:
+      settings = self.ui.ScreenStreamSettings(self.params, compact=compact)
+      for address in ['192.168.4.44', '10.0.0.20', '239.255.42.99']:
+        with self.subTest(compact=compact, address=address):
+          settings._save('address', address)
+          self.assertEqual(ScreenStreamConfig.from_params(self.params).address, address)
+          self.assertEqual(settings.items['address'].value, address)
+
   def test_edit_cancel_and_disabled_save_do_not_change_params(self):
     self.params.values['ScreenStreamEnabled'] = True
     settings = self.ui.ScreenStreamSettings(self.params)
@@ -135,12 +145,12 @@ class TestScreenStreamSettings(unittest.TestCase):
   def test_language_switch_uses_standard_catalogs(self):
     settings = self.ui.ScreenStreamSettings(self.params)
     compact = self.ui.ScreenStreamSettings(self.params, compact=True)
-    self.assertEqual(settings.items['address'].title(), 'Multicast Address')
+    self.assertEqual(settings.items['address'].title(), 'Destination Address')
     self.multilang.multilang._language = 'ja'
     self.multilang.multilang.setup()
     compact.refresh(force=True)
-    self.assertEqual(settings.items['address'].title(), 'マルチキャストアドレス')
-    self.assertEqual(compact.items['address'].title, 'マルチキャストアドレス')
+    self.assertEqual(settings.items['address'].title(), '送信先アドレス')
+    self.assertEqual(compact.items['address'].title, '送信先アドレス')
     self.assertEqual(self.multilang.tr(self.ui.STREAM_TITLE), 'UDP画面配信')
 
   def test_all_supported_languages_include_translated_stream_strings(self):

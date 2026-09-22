@@ -13,10 +13,10 @@ STREAM_DESCRIPTION = tr_noop(
   "Stream the UI over Wi-Fi. Recording or display sleep pauses streaming. Anyone on the same network can view the stream."
 )
 SETTINGS = {
-  'address': (tr_noop("Multicast Address"), tr_noop("IPv4 multicast address (224.0.1.0 - 239.255.255.255).")),
+  'address': (tr_noop("Destination Address"), tr_noop("IPv4 unicast or multicast destination. No hostnames or URLs.")),
   'port': (tr_noop("UDP Port"), tr_noop("Port: 1 - 65535.")),
   'bitrate': (tr_noop("Bitrate (kbit/s)"), tr_noop("Bitrate: 250 - 8000 kbit/s.")),
-  'ttl': (tr_noop("Multicast TTL"), tr_noop("TTL: 1 - 255. Use 1 for the local network.")),
+  'ttl': (tr_noop("Multicast TTL"), tr_noop("TTL: 1 - 255. Multicast only; ignored for unicast.")),
 }
 
 

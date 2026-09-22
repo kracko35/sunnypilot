@@ -1,4 +1,4 @@
-# sunnypilot-with-streaming
+# sunnypilot
 
 [sunnypilot](https://github.com/sunnypilot/sunnypilot) のUIを、Wi-Fi上のUDPマルチキャストで配信する開発用forkです。録画経路のRenderTextureを共有し、H.264映像をMPEG-TSとして送信します。MIB / MOST / AID側の変更は含みません。
 
@@ -81,8 +81,8 @@ Unit tests and GPU / FFmpeg / loopback UDP multicast integration tests have been
 
 ```sh
 git clone --recurse-submodules --branch udp-screen-streaming \
-  https://github.com/kracko35/sunnypilot-with-streaming.git
-cd sunnypilot-with-streaming
+  https://github.com/kracko35/sunnypilot.git
+cd sunnypilot
 git remote add upstream https://github.com/sunnypilot/sunnypilot.git
 git fetch upstream
 ```

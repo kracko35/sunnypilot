@@ -15,6 +15,7 @@ from typing import BinaryIO
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
 from openpilot.system.ui.lib.screen_stream_monitor import CachedQuery, LatencyStats
+from openpilot.system.ui.lib.screen_stream_latency import FrameTimingObserver, ProcessUsage
 
 WIDTH, HEIGHT, FPS = 800, 480, 20
 FRAME_BYTES = WIDTH * HEIGHT * 4
@@ -122,12 +123,15 @@ class MpegTsUdpSender:
                stdout_observer: Callable[[bytes], None] | None = None):
     self._stdout = stdout
     self._stdout_observer = stdout_observer
+    self.latency: FrameTimingObserver | None = None
+    self._stream_offset = 0
     self._destination = (config.address, config.port)
     self.mode = 'multicast' if ipaddress.IPv4Address(config.address).is_multicast else 'unicast'
     self.payload_size = TS_PACKET_SIZE * (MULTICAST_TS_PACKETS_PER_DATAGRAM if self.mode == 'multicast' else UNICAST_TS_PACKETS_PER_DATAGRAM)
     self.socket_sndbuf = None
     self.socket_outq_current = self.socket_outq_peak = self.socket_outq_window_peak = None
     self._next_outq_sample = 0.0
+    self.stdout_pipe_available_current = self.stdout_pipe_available_window_peak = None
     self._outq_lock = threading.Lock()
     self._stop = threading.Event()
     self.done = threading.Event()
@@ -139,6 +143,10 @@ class MpegTsUdpSender:
     self._stats_previous = (0, 0, 0, 0, 0)
     self._stats_started = time.monotonic()
     self._last_drop_log: float | None = None
+    self._io = dict.fromkeys(('sendto_calls', 'sendto_eagain_count', 'stdout_read_calls', 'stdout_eagain_count', 'sendto_seconds',
+                              'stdout_wait_seconds'), 0)
+    self._io_previous = self._io.copy()
+    self._sendto_max = self._stdout_wait_max = 0.0
     self._thread = threading.Thread(target=self._run, name="ui-screen-udp", daemon=True)
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
@@ -170,22 +178,41 @@ class MpegTsUdpSender:
       raise TimeoutError("画面配信の送信スレッドを停止できません")
 
   def _send_datagram(self, payload: bytes) -> bool:
+    sent = False
+    self._io['sendto_calls'] += 1
+    attempted_at = self.latency.clock() if self.latency is not None else 0.0
+    started = time.perf_counter()
     try:
-      if self._socket.sendto(payload, self._destination) != len(payload):
+      try:
+        written = self._socket.sendto(payload, self._destination)
+      finally:
+        duration = time.perf_counter() - started
+        returned_at = self.latency.clock() if self.latency is not None else 0.0
+      if written != len(payload):
         raise OSError("画面配信のUDPデータグラムを送信できません")
     except OSError as error:
       if not isinstance(error, (BlockingIOError, InterruptedError, TimeoutError)) and error.errno not in TRANSIENT_SEND_ERRNOS:
         raise
       # 一時的な輻輳では古い映像を再送せず、エンコーダと次のデータグラムを維持する。
       self.datagrams_dropped += 1
+      if isinstance(error, BlockingIOError) or error.errno in (errno.EAGAIN, errno.EWOULDBLOCK, getattr(errno, 'WSAEWOULDBLOCK', 10035)):
+        self._io['sendto_eagain_count'] += 1
       now = time.monotonic()
       if self._last_drop_log is None or now - self._last_drop_log >= UDP_DROP_LOG_INTERVAL:
         cloudlog.warning(f"screen stream UDP drops: dropped={self.datagrams_dropped} sent={self.datagrams_sent} last_errno={error.errno}")
         self._last_drop_log = now
       return False
-    self.datagrams_sent += 1
-    self.bytes_sent += len(payload)
-    return True
+    else:
+      self.datagrams_sent += 1
+      self.bytes_sent += len(payload)
+      sent = True
+      return True
+    finally:
+      self._io['sendto_seconds'] += duration
+      self._sendto_max = max(self._sendto_max, duration)
+      if self.latency is not None:
+        self.latency.datagram(self._stream_offset, self._stream_offset + len(payload), returned_at, sent, attempted_at)
+      self._stream_offset += len(payload)
 
   def sample_outq(self):
     # Linuxのsocketキューをサンプリングする。NIC・無線・受信側のキューは含まない。
@@ -209,6 +236,18 @@ class MpegTsUdpSender:
     except (OSError, ValueError, TypeError, AttributeError, ImportError):
       with self._outq_lock:
         self.socket_outq_current = None
+    try:
+      import array
+      import fcntl
+      import termios
+      available = array.array('i', [0])
+      fcntl.ioctl(self._stdout.fileno(), termios.FIONREAD, available, True)
+      with self._outq_lock:
+        self.stdout_pipe_available_current = available[0]
+        self.stdout_pipe_available_window_peak = max(self.stdout_pipe_available_window_peak or 0, available[0])
+    except (OSError, ValueError, TypeError, AttributeError, ImportError):
+      with self._outq_lock:
+        self.stdout_pipe_available_current = None
 
   def stats_snapshot(self, now: float):
     # 累積カウンターの差を取り、送信ループで毎packetの統計整形をしない。
@@ -219,7 +258,20 @@ class MpegTsUdpSender:
     with self._outq_lock:
       outq = (self.socket_outq_current, self.socket_outq_peak, self.socket_outq_window_peak)
       self.socket_outq_window_peak = None
+      pipe = self.stdout_pipe_available_current, self.stdout_pipe_available_window_peak
+      self.stdout_pipe_available_window_peak = None
+    io = self._io.copy()
+    delta = {key: value - self._io_previous[key] for key, value in io.items()}
+    self._io_previous = io
+    send_max, wait_max = self._sendto_max, self._stdout_wait_max
+    self._sendto_max = self._stdout_wait_max = 0.0
     return {
+      **{key: value for key, value in delta.items() if not key.endswith('_seconds')},
+      'sendto_avg_us': round(delta['sendto_seconds'] * 1e6 / max(delta['sendto_calls'], 1), 3),
+      'sendto_max_us': round(send_max * 1e6, 3), 'stdout_wait_ms': round(delta['stdout_wait_seconds'] * 1000, 3),
+      'stdout_wait_max_ms': round(wait_max * 1000, 3),
+      'stdout_bytes': stdout_bytes, 'stdout_chunks': stdout_chunks,
+      'stdout_pipe_available_current': pipe[0], 'stdout_pipe_available_window_peak': pipe[1],
       'sender_datagrams': current[0], 'sender_drops': current[1], 'sender_bytes': current[2],
       'sender_drop_ratio_pct': round(100 * current[1] / max(current[0] + current[1], 1), 4),
       'sender_datagrams_delta': sent, 'sender_drops_delta': dropped, 'sender_bytes_delta': sent_bytes,
@@ -242,9 +294,16 @@ class MpegTsUdpSender:
     try:
       while not self._stop.is_set():
         try:
+          self._io['stdout_read_calls'] += 1
           chunk = os.read(self._stdout.fileno(), 65536)
+          observed_at = self.latency.clock() if self.latency is not None else 0.0
         except BlockingIOError:
+          self._io['stdout_eagain_count'] += 1
+          before = time.perf_counter()
           self._wait_readable()
+          elapsed = time.perf_counter() - before
+          self._io['stdout_wait_seconds'] += elapsed
+          self._stdout_wait_max = max(self._stdout_wait_max, elapsed)
           continue
         if not chunk:
           # 正常EOFだけ端数の完全なTSパケットを送り、停止時は古いstreamの末尾を送らない。
@@ -255,6 +314,8 @@ class MpegTsUdpSender:
         # 診断時だけ観測時刻とbytesを保存する。通常配信にはPES解析を入れない。
         if self._stdout_observer is not None:
           self._stdout_observer(chunk)
+        if self.latency is not None:
+          self.latency.observe(chunk, observed_at)
         pending.extend(chunk)
         self.stdout_bytes += len(chunk)
         self.stdout_chunks += 1
@@ -280,7 +341,11 @@ class ScreenStreamer:
     self._enabled = enabled
     self._network = network
     self._config = config
-    self._frames: queue.Queue[tuple[float, bytes]] = queue.Queue(maxsize=1)
+    self._frames: queue.Queue[tuple[float, bytes, int]] = queue.Queue(maxsize=1)
+    self._frame_sequence = 0
+    self._latency: FrameTimingObserver | None = None
+    self._usage: ProcessUsage | None = None
+    self._stats_window = 0
     self.ready = threading.Event()
     self.visible = threading.Event()
     self._stop = threading.Event()
@@ -311,7 +376,8 @@ class ScreenStreamer:
       replaced = 1
     except queue.Empty:
       pass
-    self._frames.put_nowait((time.monotonic() if captured is None else captured, data))
+    self._frame_sequence += 1
+    self._frames.put_nowait((time.monotonic() if captured is None else captured, data, self._frame_sequence))
     self.stats.record({'submitted_count': 1, 'queue_replaced_count': replaced})
 
   def close(self):
@@ -333,7 +399,12 @@ class ScreenStreamer:
     values.update(stats_window_s=round(elapsed, 6), capture_fps=round(values['capture_count'] / elapsed, 3),
                   submitted_fps=round(values['submitted_count'] / elapsed, 3), frames_written_fps=round(values['frames_written'] / elapsed, 3))
     values.update(sender.stats_snapshot(now))
-    values.update(pid=self._proc.pid, bitrate=config.bitrate, mode=sender.mode)
+    if self._latency is not None:
+      values.update(self._latency.snapshot(now, elapsed, final=final_reason is not None))
+    if self._usage is not None:
+      values.update(self._usage.sample(now))
+    self._stats_window += 1
+    values.update(pid=self._proc.pid, bitrate=config.bitrate, mode=sender.mode, window_id=self._stats_window)
     prefix = 'screen stream latency stats: ' if final_reason is None else f'screen stream latency final: reason={final_reason!r} '
     cloudlog.info(prefix + ' '.join(f'{key}={value}' for key, value in values.items()))
     if (values['sender_datagrams_delta'] + values['sender_drops_delta'] >= UDP_CONGESTION_MIN_ATTEMPTS
@@ -351,6 +422,7 @@ class ScreenStreamer:
         cloudlog.exception('screen stream latency final failed')
       self._active_config = None
     proc, self._proc = self._proc, None
+    self._latency = self._usage = None
     sender, self._sender = self._sender, None
     if sender is not None:
       sender.stop()
@@ -407,33 +479,50 @@ class ScreenStreamer:
       cloudlog.warning(f"screen stream network query {state}: failures={self._network_query_failures} using={network!r} error={error!r}")
       self._last_network_error_log = now
 
-  def _write_frame(self, captured: float, data: bytes):
+  def _write_frame(self, captured: float, data: bytes, sequence: int = 0, dequeued: float | None = None):
     assert self._proc is not None and self._proc.stdin is not None
     remaining = memoryview(data)
     started = time.monotonic()
     deadline = started + PIPE_WRITE_TIMEOUT
-    while remaining:
-      self._check_sender()
-      if self._stop.is_set():
-        raise StreamStopped("shutdown")
-      if not self.visible.is_set():
-        raise StreamStopped("screen invisible")
-      now = time.monotonic()
-      if now >= deadline:
-        # rawvideoの途中を破棄すると次フレームの境界が壊れるため、プロセスごと再開する。
-        raise FrameWriteTimeout(f"frame write timeout age={now - captured:.3f}s write_elapsed={now - started:.3f}s remaining_bytes={len(remaining)}")
-      try:
-        written = os.write(self._proc.stdin.fileno(), remaining)
-        if written == 0:
-          raise BrokenPipeError("画面配信の入力パイプが閉じられました")
-        remaining = remaining[written:]
-      except BlockingIOError:
-        if os.name == 'posix':
-          select.select([], [self._proc.stdin.fileno()], [], min(0.05, max(0, deadline - time.monotonic())))
-        else:
-          self._stop.wait(0.001)
-      except OSError as error:
-        raise ScreenStreamError(f"frame pipe broken: rc={self._proc.poll()} errno={error.errno} error={error!r}") from error
+    observer = self._latency
+    if observer is not None:
+      observer.begin(sequence, captured, started if dequeued is None else dequeued, started)
+    calls = blocked = size = 0
+    wait = maximum = 0.0
+    try:
+      while remaining:
+        self._check_sender()
+        if self._stop.is_set():
+          raise StreamStopped("shutdown")
+        if not self.visible.is_set():
+          raise StreamStopped("screen invisible")
+        now = time.monotonic()
+        if now >= deadline:
+          # rawvideoの途中を破棄すると次フレームの境界が壊れるため、プロセスごと再開する。
+          raise FrameWriteTimeout(f"frame write timeout age={now - captured:.3f}s write_elapsed={now - started:.3f}s remaining_bytes={len(remaining)}")
+        try:
+          calls += 1
+          written = os.write(self._proc.stdin.fileno(), remaining)
+          if written == 0:
+            raise BrokenPipeError("画面配信の入力パイプが閉じられました")
+          size += written
+          remaining = remaining[written:]
+        except BlockingIOError:
+          blocked += 1
+          before = time.perf_counter()
+          if os.name == 'posix':
+            select.select([], [self._proc.stdin.fileno()], [], min(0.05, max(0, deadline - time.monotonic())))
+          else:
+            self._stop.wait(0.001)
+          elapsed = time.perf_counter() - before
+          wait += elapsed
+          maximum = max(maximum, elapsed)
+        except OSError as error:
+          raise ScreenStreamError(f"frame pipe broken: rc={self._proc.poll()} errno={error.errno} error={error!r}") from error
+    finally:
+      self.stats.record_stdin(calls, blocked, size, wait, maximum)
+      if observer is not None:
+        observer.complete(sequence, time.monotonic(), success=not remaining)
 
   def _run(self):
     current_network = None
@@ -526,6 +615,10 @@ class ScreenStreamer:
               self._sender = MpegTsUdpSender(self._proc.stdout, current_network[1], current_config)
             except OSError as error:
               raise SenderFatalError(f"sender fatal error during setup: errno={error.errno} error={error!r}") from error
+            self._latency = FrameTimingObserver()
+            self._usage = ProcessUsage(self._proc.pid)
+            self._stats_window = 0
+            self._sender.latency = self._latency
             self._sender.start()
             self._active_config = current_config
             cloudlog.info(f"screen stream started: pid={self._proc.pid} mode={self._sender.mode} network={current_network!r} " +
@@ -537,15 +630,16 @@ class ScreenStreamer:
             self.ready.set()
           self._log_latency_stats(current_config)
           try:
-            captured, data = self._frames.get(timeout=0.05)
+            captured, data, sequence = self._frames.get(timeout=0.05)
           except queue.Empty:
             continue
-          age = time.monotonic() - captured
+          dequeued = time.monotonic()
+          age = dequeued - captured
           self.stats.record(queue_age=age)
           if age < FRAME_MAX_AGE:
             started = time.monotonic()
             try:
-              self._write_frame(captured, data)
+              self._write_frame(captured, data, sequence, dequeued)
             finally:
               self.stats.record(stdin_write=time.monotonic() - started)
             self.stats.record({'frames_written': 1}, frame_age_written=time.monotonic() - captured)

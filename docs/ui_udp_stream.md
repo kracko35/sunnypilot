@@ -43,7 +43,7 @@ ffmpeg -hide_banner -muxers 2>/dev/null | grep mpegts
 
 必要なのはlibx264、MPEG-TS、file/pipe。comma標準FFmpegのUDP非対応でもPython socketで送信する。hardware H.264 encoderは実機のcapability確認後に判断し、自動選択しない。Windowsの`.venv`は端末へコピーしない。
 
-設定 → トグル → UDP Screen Streaming（日本語: UDP画面配信）をONにする。Destination AddressをPCのWi-Fi IPv4、ポート12346、最初は500 kbit/sに設定。1000、1500へ変更して各15～30秒以上配信し、5秒statsを複数採取する。保存直後のsenderとFFmpegの再生成は正常であり、試験途中の障害再起動と区別する。
+設定 → トグル → UDP Screen Streaming（日本語: UDP画面配信）をONにする。Destination AddressをPCのWi-Fi IPv4、ポート12346、最初は500 kbit/sに設定。1000、1500へ変更して各条件で約10秒ウォームアップし、その後30秒以上測定して5秒statsを複数採取する。保存直後のsenderとFFmpegの再生成は正常であり、試験途中の障害再起動と区別する。
 
 ## 設定と互換性
 
@@ -141,9 +141,10 @@ for BITRATE in 500 1000 1500; do
     | grep "screen stream latency stats:" | grep "bitrate=$BITRATE " | tail -10
 done
 grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream UDP drops" | tail -30
-grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream UDP congestion:" | tail -30
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream UDP congestion:" | tail -20
 grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream latency final:" | tail -30
 grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep -E "screen stream (restart|started)" | tail -30
+grep -R -h -a "\"commit\": \"$HASH\"" /data/log 2>/dev/null | grep "screen stream restart:" | tail -20
 pgrep -a -x ffmpeg
 tc -s qdisc show dev wlan0
 ```
@@ -163,6 +164,8 @@ tc -s qdisc show dev wlan0
 | bytes_copy_avg_ms / max_ms | bytesへのコピー時間 |
 | queue_age_avg_ms / max_ms | キャプチャ開始からキュー取り出しまで。破棄frameも含む |
 | stdin_write_avg_ms / max_ms | 書き込み開始から完了または失敗まで |
+| stdin_write_syscalls / stdin_bytes / stdin_blocked_events | os.write試行数（EAGAINを含む）／成功bytes／BlockingIOError数 |
+| stdin_blocked_wait_ms / avg_ms / max_ms | BlockingIOError後のselect等の待ちの合計／1回平均／最大 |
 | frame_age_written_avg_ms / max_ms | キャプチャ開始から完全書き込み終了まで |
 | sender_datagrams / sender_drops / sender_bytes | senderの累積送信成功数・破棄数・成功bytes |
 | sender_drop_ratio_pct | 累積drop /（成功 + drop）×100 |
@@ -173,13 +176,70 @@ tc -s qdisc show dev wlan0
 | stats_window_s / capture_fps / submitted_fps / frames_written_fps | 実際の区間秒数とcapture・submit・完全stdin書き込みの各回数/秒 |
 | socket_sndbuf | getsockoptで取得した実容量 |
 | socket_outq_current / socket_outq_peak / socket_outq_window_peak | 最新サンプル／sender生成後の最大／前回stats以降の最大。未観測はNone |
-| pid / bitrate / mode | 現在のエンコーダと送信設定 |
+| pid / bitrate / mode / window_id | 現在のエンコーダと送信設定、プロセス内の統計区間番号 |
 
 capture～frames_writtenと時間統計は前回ログからの区間値で、各時間の平均はその測定サンプル数を分母にする。rateは固定の5秒ではなく実経過時間で割る。senderの累積値と区間差分を両方残す。送信と統計のスレッドは並行するため、カウンターの採取境界や処理段階をまたぐframeによって同一区間の数は完全には一致しない。
 
 終了・設定変更・再起動ではencoder/senderを閉じる前に`screen stream latency final: reason=...`を1回出し、5秒未満の区間も保存する。停止済みの状態でcloseを繰り返しても重複しない。採取後から送信スレッド停止までのごく短い差はあり得る。新しいencoderで区間統計とsender累積値をリセットする。ログ採取の例外が起きても停止処理は続ける。
 
 500→1000→1500でstdout量・drop率・outq・stdin_write・queue_ageが同じ区間で増えるか確認する。stdout_bytes_per_secは「既に読み取れた量」であって未読キュー容量ではない。低い値だけでエンコーダが遅いと断定しない。queue_replaced増加、frames_written_fps低下、stdin_write悪化も合わせて見る。後述のパイプ単独とUDP経由のフレーム診断で差が出れば、送信処理からの逆圧の仮説を補強できる。
+
+## 実UI配信のstage観測
+
+`4d032be`で送信側の564-byte集約・OS既定SO_SNDBUF・100ms outq取得・区間drop統計を導入した。今回それらの値とGPU、FFmpegコマンド、20fps、75ms／100ms期限、receiverを固定し、未観測だったstdin→PES→UDPの区間を追加する。変更後のcomma実測はまだなく、送信混雑の改善量も未確認。
+
+本番モジュール`screen_stream_latency.py`はtestsをimportしない。UIで受理したframeには単調増加のsequenceを付け、FFmpegへの書き込み開始前にsequence・capture開始・dequeue・stdin開始を登録する。書き込み完了は後から結合する。キュー置換やstale破棄で書き込まなかったsequenceの空白は許容し、書き込み対象の順序でPESへ仮対応する。
+
+TS observerは188-byte packetのヘッダー、adaptation長、映像PIDのcontinuity counter、PUSI、映像PES開始コード、PTSだけを読む。未完成TSは最大187 bytesとその観測時刻のみ保持し、H.264 payloadの解析・再復号・映像保存・本番UIへのmarker描画は行わない。PESヘッダーは現在のFFmpegと同様に先頭TS内に収まる出力に限定する。read境界で分かれたヘッダーも処理し、PES先頭byteを含んだ最初のread時刻を使用する。
+
+対応の前提は単一映像PID・H.264・B=0・1入力につき1 PES・入力順の出力。次の条件を検査する。
+
+- sequenceが逆行・重複せず、入力時刻の順序が正しい。
+- TSの同期・エラーフラグ・連続性に異常がなく、映像PIDが変わらない。
+- PTSが前進する。33 bitの正常wrapは許容する。gapは2秒以下で、入力開始間隔との差は100ms以内（入力読み取り時刻と20fps量子化の差を含む）。
+- 未対応の入力なしにPESが来ない。入力数とPES数が釣り合い、書き込み・対象datagramの送信結果が揃うまで区間の標本を確定しない。
+- 未確定記録は最大32件、最古の入力開始から2秒以内。overflow時は古い記録を黙って捨てて対応をずらさない。
+
+1 frameが欠落して後続PESが一つ前の入力へ仮対応しても、未対応入力が残る間は標本を公開しない。連続した遅延で入力/PESの釣り合いが戻らない場合も、2秒または32件で計測を断念する。この保守的な条件により、混雑時には数値の代わりに「計測不能」が出る場合がある。
+
+異常時は`diag_sync_lost`を1加算し、未確定記録を破棄、`diag_active=0`と固定の`diag_reason`を出す。通常の送信は継続し、observerを理由にencoderをrestartしない。途中のPESから再同期を推測せず、次のFFmpegプロセスで新しいobserverを作る。終了時の未確定入力もfinalへ`unfinished_at_close`として残すが、これは通常停止で出力を打ち切った場合にも起きる。
+
+この方式は映像のidentityを厳密に証明するものではない。前提外の同数の欠落と重複など、ヘッダーと数だけでは検出できない組合せはある。固定した本番コマンドについて、別途markerを復号する厳密な試験で順序対応を検証する。`diag_active=0`、`diag_pending`増加、標本0の区間を健全な0msと解釈しない。
+
+| 新しい統計 | 意味 |
+| --- | --- |
+| encoder_pes_samples / pes_events | 区間で対応を確定したframe数／observerが同期中に受けたPES数 |
+| diag_sync_lost / diag_active / diag_reason / diag_pending | 区間内の同期喪失数／有効状態／最後の理由／未確定記録数 |
+| pes_events_per_sec / frames_paired_per_sec | PES観測数／確定frame数を区間実時間で割った値 |
+| capture_to_pes_avg_ms / p95_ms / max_ms | GPU操作前のcapture開始→PES先頭byteのstdout初観測 |
+| stdin_start_to_pes_avg_ms / p95_ms / max_ms | stdin開始→同じPES初観測。主要指標 |
+| stdin_complete_to_pes_avg_ms / p95_ms / max_ms | stdin完了→PES初観測。readerが先行した負値も保持 |
+| pes_to_send_attempt_avg_ms / p95_ms / max_ms | PES初観測→先頭TSを含むdatagramのsendto開始。dropも含む |
+| pes_to_send_avg_ms / p95_ms / max_ms | PES初観測→同datagramのsendto成功復帰 |
+| capture_to_udp_send_avg_ms / p95_ms / max_ms | capture開始→同datagramのsendto成功復帰 |
+| 各stage名_samples | その平均・p95・最大に使った標本数 |
+| frame_first_datagram_drop_count | 対応確定frameの先頭TSを含むdatagramが送信失敗した数 |
+| sendto_calls / sendto_eagain_count | 区間のsendto試行数／EAGAIN系の回数 |
+| sendto_avg_us / sendto_max_us | sendto呼び出し時間。警告ログ・observer処理は含まない |
+| stdout_read_calls / stdout_eagain_count | read試行数（EOFも含む）／EAGAIN回数 |
+| stdout_wait_ms / stdout_wait_max_ms | EAGAIN後のselect等の待ち合計／1回最大 |
+| stdout_bytes / stdout_chunks | 同区間に読み取れたbytes／空でないread数。既存deltaの別名 |
+| stdout_pipe_available_current / stdout_pipe_available_window_peak | Linux FIONREADの最新／区間内の観測最大bytes |
+| ffmpeg_cpu_pct / ffmpeg_rss_kb | FFmpeg子プロセスのCPU割合／RSS。未取得はNone |
+
+stageごとに最大200標本を保持し、約5秒ごとの出力でリセットする。200件を超えた場合は直近200件の平均・p95・最大となる。p95はnearest-rank方式。標本0なら時間はNone。`encoder_pes_samples`は区間の全確定数なので、上限を超える場合やdropがある場合に個別stageのsamplesと一致しない。dropしたdatagramは成功送信までの時間へ含めず、attempt時間とdrop件数に残す。windowをまたいだ未確定記録は、確定した側のwindowへまとめる。
+
+PESを含むTSの絶対byte offsetを追跡し、564／1316-byte集約やread境界と独立してdatagramへ対応付ける。sendto開始と復帰を記録するが、これは**frameの最初のTSを含むdatagram**の時間であり、frame全体のencode・送信完了や無線送信完了ではない。
+
+stdout待ちは「その時点でreadできなかった時間」で、encoder CPUだけを示さない。20fpsの正常なframe間待ちも含むため、合計がwindowの大半でもそれだけで遅延異常とは判断しない。stdinのblocked待ちはFFmpegの入力取り込みが進まない状況を示すが、encoder CPU不足と下流の逆圧の両方で起こり得る。CPU・pipe残量・outq・stage時間を同じwindow_idで合わせて判断する。
+
+FIONREADは既存outqと共通の100ms制限を使い、各種類のioctlを最大約10回/秒に抑える。readバッチ処理後とstats時に取得するため、瞬間最大値の保証はない。非Linux・未対応・fd終了・取得失敗はNone、配信は継続する。window_peakだけstatsごとにリセットする。[Linux pipeのFIONREAD](https://man7.org/linux/man-pages/man7/pipe.7.html)を参照。
+
+FFmpeg CPUはstatsとfinalの時だけ`/proc/<pid>/stat`を読み、utime+stime差分をCLK_TCKと実経過時間で割る。1コアを100%とし、複数コア使用時は100%を超え得る。初回は基準値を取るためCPU=None。PIDのstarttimeで再利用を検査し、RSS概算はresident pages×page sizeからKiBにする。PID消失・解析失敗はNoneにして次回基準を取り直す。[Linux proc_pid_stat](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html)の定義に従う。
+
+計測負荷は、小さいヘッダー走査、少数の単調時計読み取り、固定容量の記録へ限定する。stdinはframeごとに一度だけ集計ロックを取り、PESを含まないdatagramではobserverロックを取らない。PES解析・p95ソート・/proc読取を入力側との共有ロックの外へ置く。毎frame／packetのログは追加せず、既存の約5秒statsとfinalへ集約する。I/O countersは送信スレッドの累積値の差分なので、並行採取の境界でcall数と時間が隣接windowへ分かれることはある。OFF／idleではobserver、sender、/proc照会を動作させない。
+
+stageの読み方はcapture→queue取り出し→stdin開始→stdin完了→PES初観測→先頭datagramのsendto復帰。既存queue_ageはcapture時間を含むのでcaptureと単純加算しない。また`glass-to-glass - capture_to_udp_send`はWi-Fi＋PC側に加え、残りのframe bytesの出力・送信と測定起点の違いも含む概算で、ネットワーク単独の遅延ではない。
 
 ## 受信と切り分け
 
@@ -208,7 +268,7 @@ gst-launch-1.0 -v udpsrc address=0.0.0.0 port=12346 buffer-size=65536 caps="vide
 
 ## 実機A/Bと遅延測定
 
-同じAP、機器位置、UI操作、PC電源設定、画面リフレッシュレートを固定する。まず500／1000／1500 kbit/sの各条件を15～30秒以上配信し、5秒statsを複数採る。PID・drop・遅延が安定したら10秒ウォームアップ後に5分測定し3回以上繰り返す。通常の設定変更時だけPIDが変わり、測定中は安定していることを確認する。
+同じAP、機器位置、UI操作、PC電源設定、画面リフレッシュレートを固定する。500／1000／1500 kbit/sの各条件で設定変更後約10秒ウォームアップし、その後最低30秒ずつ測定する。現在のcommitの5秒statsを複数採る。PID・drop・遅延が安定したら5分測定を3回以上繰り返す。通常の設定変更時だけPIDが変わり、測定中は安定していることを確認する。ログは同じlatency prefixの1行へ集約しており、別のtransport prefixは追加していない。
 
 1. unicast＋通常FFplay。
 2. 同じunicast＋低遅延FFplay。細分化するならprobesize / analyzedurationを固定した基準へmax_delay、次にnobuffer / low_delay / framedropを加える。directは試験項目から除外する。
@@ -236,19 +296,30 @@ comma画面とPC画面を同時にスマートフォンの60fps以上で撮影�
 | capture / readback 平均・最大ms | 未測定 | 未測定 | 未測定 |
 | queue_age 平均・最大ms | 未測定 | 未測定 | 未測定 |
 | stdin_write 平均・最大ms | 未測定 | 未測定 | 未測定 |
+| stdin blocked wait 平均・最大ms／回数 | 未測定 | 未測定 | 未測定 |
 | frame_age_written 平均・最大ms | 未測定 | 未測定 | 未測定 |
+| capture→PES 平均・p95・最大ms | 未測定 | 未測定 | 未測定 |
+| stdin開始→PES 平均・p95・最大ms | 未測定 | 未測定 | 未測定 |
+| stdin完了→PES 平均・p95・最大ms | 未測定 | 未測定 | 未測定 |
+| PES→UDP send 平均・p95・最大ms | 未測定 | 未測定 | 未測定 |
+| capture→UDP send 平均・p95・最大ms | 未測定 | 未測定 | 未測定 |
+| diag_active / diag_sync_lost / diag_reason / samples | 未測定 | 未測定 | 未測定 |
 | stdout bytes/秒・chunks/区間 | 未測定 | 未測定 | 未測定 |
 | 成功datagrams/秒・drop/秒 | 未測定 | 未測定 | 未測定 |
 | drop率 区間／累積% | 未測定 | 未測定 | 未測定 |
 | socket_sndbuf 実値 | 未測定 | 未測定 | 未測定 |
 | outq current / window_peak / peak | 未測定 | 未測定 | 未測定 |
+| stdout pipe window peak | 未測定 | 未測定 | 未測定 |
+| stdout EAGAIN／wait 合計・最大ms | 未測定 | 未測定 | 未測定 |
+| sendto 平均・最大µs／EAGAIN | 未測定 | 未測定 | 未測定 |
+| FFmpeg CPU %／RSS KiB | 未測定 | 未測定 | 未測定 |
 | qdisc backlog / drops | 未測定 | 未測定 | 未測定 |
 | PID安定・restart reason | 未確認 | 未確認 | 未確認 |
 | 画質・Packet corrupt／H.264エラー | 未確認 | 未確認 | 未確認 |
 | glass-to-glass 中央値／最大ms | 未測定 | 未測定 | 未測定 |
 | 診断stdin→stdout 平均／p95／最大ms（別試験） | 未測定 | 未測定 | 未測定 |
 
-成功基準: 全bitrateでdrop率ほぼ0、outqが恒常的に満杯にならない、queue replacementが0またはごく少数、stdin_writeがbitrate上昇で極端に悪化しない、frame_age_writtenはできれば50ms以下中心、PID安定、従来のunicast画質維持、glass-to-glassが約800／1300msから改善すること。
+今回の成功基準は100ms達成そのものではなく、送信混雑修正を維持し、dropの改善量と実UIのcapture→PES→UDPのstage時間を説明でき、高bitrateで増える区間を特定できること。計測で明らかな性能悪化がない、PID安定・unicast画質維持も確認する。数値を得られない場合もdiag状態を必ず記録する。配信側の継続目標はdrop率ほぼ0、outqが恒常的に満杯にならない、queue replacementがごく少数、frame_age_writtenはできれば50ms以下中心、glass-to-glassが約800／1300msから改善すること。
 
 負荷・温度・UI FPS、OFF/ON、消灯/復帰、Wi-Fi切断/再接続/IP変更、録画との排他も確認する。実機の受信PTSを調べる場合は、例えば短時間だけPCで`ffmpeg -i "udp://0.0.0.0:12346" -t 10 -c copy sample.ts`と記録し、`ffprobe -select_streams v:0 -show_frames -show_entries frame=pts_time -of csv sample.ts`でgapを確認する。採取中は別receiverを同時起動しない。
 
@@ -257,7 +328,7 @@ comma画面とPC画面を同時にスマートフォンの60fps以上で撮影�
 通常の単体テスト:
 
 ```sh
-python -m unittest openpilot.system.ui.lib.tests.test_screen_stream openpilot.system.ui.lib.tests.test_screen_capture openpilot.system.ui.lib.tests.test_screen_stream_settings openpilot.system.ui.lib.tests.test_screen_stream_diagnostics -v
+python -m unittest openpilot.system.ui.lib.tests.test_screen_stream openpilot.system.ui.lib.tests.test_screen_capture openpilot.system.ui.lib.tests.test_screen_stream_settings openpilot.system.ui.lib.tests.test_screen_stream_diagnostics openpilot.system.ui.lib.tests.test_screen_stream_latency -v
 ```
 
 FFmpegパスをSCREEN_STREAM_TEST_FFMPEGへ指定すると、不規則入力の統合テストを実行できる。GPUテストには追加でSCREEN_STREAM_TEST_GPU=1を指定する。Linux例:
@@ -277,7 +348,7 @@ python -m unittest openpilot.system.ui.lib.tests.test_screen_stream_timestamps o
 python -m openpilot.system.ui.lib.tests.benchmark_screen_stream --frames 100 --output stream-pipe.json
 ```
 
-2026-09-22、Windows / Python 3.12 / FFmpeg 7.1で検証。単体89件、PTS・フレーム対応のFFmpeg統合3件、本番senderを使う実UDP診断1件が成功。既存GPU統合3件は維持したが、今回の実行セッションではGLFWの画面／OpenGL初期化に失敗したため再検証できなかった。初期化失敗時にネイティブアクセス違反を起こさないよう、明示的にskipする。前回コミットではRaylib 6.1-dev / RTX 3060で3件とも成功している。Ruffとgit diff --checkも確認する。
+2026-09-22、Windows / Python 3.12 / FFmpeg 7.1 / Raylib 6.1-dev / RTX 3060で検証。既存96件相当を維持し、本番observer・I/O・Linux計測のモック検証を追加する。前回実行できなかったGPU統合も今回は3件実行できた。Linux select / ioctl / procはこの環境ではモックで確認し、commaでの実測は未実施。最終件数とbenchmark結果は下記に記録する。
 
 既存の設定・翻訳・再起動・排他・送信エラー・75ms破棄・100ms書き込み期限・キャプチャ時刻・monitor検証を維持。188／376／564／1316 bytesの順序とTS境界、564の既定集約、SO_SNDBUF強制指定なし、getsockopt、outq 100ms制限とwindow reset、区間比率・rate、混雑警告でもPID維持、5秒未満のfinal flushと例外時cleanupを検証する。Linux select / ioctlはWindowsではモック。フレーム診断は分割PESヘッダー・PTS・識別子・欠落／順序変更拒否を検証し、実FFmpegと本番Python senderのローカルUDP経路でbytesが一致した。
 
@@ -289,9 +360,9 @@ benchmark_screen_stream.pyは500／1000／1500／3000 kbit/sを順に測る。�
 
 JSONのframe_timingsにinput_arrival_s、stdin_complete_s、pts_90k、stdout_first_observed_s、stdin_to_stdout_ms（T2−T1）、arrival_to_stdout_msを保存する。summaryは平均・p95・最大を含む。T2はPES先頭を読み取った観測時刻で、frame全体の出力完了・socket送信完了・受信時刻ではない。エンコーダ単体ではなく、mux・パイプ・OSスケジューリング・read単位の遅れも含む。writerがwriteから復帰する前にreaderが記録する場合は負値があり得るため、0へ丸めずnegative_latency_samplesも出す。
 
-通常のUI配信にはPES解析・frame番号・bytes保存を入れない。診断時も解析と復号は計測後なのでstdout読み出しを妨げない。ただしbytes保存と観測の処理負荷は残る。入力は同じ合成模様＋番号で、実UIの運動量・GPU負荷・最悪負荷を代表しない。
+厳密照合のための全体保存・marker復号はこの合成映像benchmarkに限定する。オフライン解析と復号は計測後に実施する。同時に、本番の小さいobserverへ同じ入力・read時刻を渡して結果を比較する。Windowsのmonotonicは分解能が粗い場合があるためbenchmark内は高分解能perf_counterに統一し、本番Linuxではcaptureと同じmonotonicを使う。入力は同じ合成模様＋番号で、実UIの運動量・GPU負荷・最悪負荷を代表しない。
 
-開発PCのパイプ単独、100frame・20fps相当の実測（全条件で番号とPTSが一致、PTS経過4.950秒、負値0件）:
+`4d032be`時点の開発PCのパイプ単独、100frame・20fps相当の実測（全条件で番号とPTSが一致、PTS経過4.950秒、負値0件）:
 
 | kbit/s | stdin平均／最大ms | 各frame stdin→stdout 平均／p95／最大ms | 到着→stdout平均ms | stdout bytes/秒 |
 | --- | --- | --- | --- | --- |
@@ -322,12 +393,31 @@ FFmpegの実パスを指定する。UDP時もエンコーダのprotocol whitelis
 
 パイプ単独でもT2−T1が大きければencoder／mux／読み出しを調べる。UDP経由だけでstdinやT2−T1が悪化し、drop・outqも増えれば下流負荷の影響を疑う。各bitrateで繰り返し、温度とCPU負荷も揃える。合成映像は通常UIとは異なるため、診断だけで実機UIの因果を断定しない。
 
-今回の本体ビルド・Linux実socket計測・変更後の実機負荷／画面遅延・本家CI全体は未実施。Windowsの単体テストではswaglogのネイティブ依存をモックにし、cloudlogへ渡す内容を検証する。実機でcloudlogが保存されることは既報。
+### 本番observerとの照合と計測負荷
+
+CLIは本番observerを既定で有効にする。`--without-observer`を加えるとobserverだけ無効にできる。これはベンチマーク用の比較スイッチで、本番UIの新しい設定ではない。厳密なmarker/PES対応が成功したうえで、observerの有効状態、全入力と同数の確定標本、直近最大200件のstdin完了→PESの平均・p95・最大の差を検査する。1msを超える差は失敗扱いとする。パイプ単独ではUDP送信を模擬して内部記録を確定するが、送信時間の値は結果から除外し、UDPの測定値として報告しない。
+
+本実装の開発PCで各100frameを計測した結果。observerの呼び出し時間はbegin・complete・TS解析・対応付けにかかった経過時間の合計をframe数で割ったもの。CPU使用率ではなく、senderのI/O計測・Linux ioctl・proc読取のコストは含まない。
+
+| kbit/s | observer ONのstdin→PES 平均／p95／最大ms | observer OFFの平均ms（別試行） | observer呼出ms/frame | ONのthroughput fps |
+| --- | --- | --- | --- | --- |
+| 500 | 6.276 / 10.355 / 11.889 | 9.438 | 0.138 | 20.092 |
+| 1000 | 7.225 / 10.002 / 10.660 | 9.033 | 0.209 | 20.172 |
+| 1500 | 7.510 / 9.989 / 11.285 | 8.927 | 0.246 | 20.092 |
+| 3000 | 9.813 / 11.228 / 12.090 | 9.778 | 0.434 | 20.074 |
+
+全条件で100件の対応が確定し、diag_sync_lost=0。厳密診断との差は平均・p95・最大とも0.0005ms以内（統計の丸め差）。OFFのthroughputは20.076～20.084fps。別試行のOSスケジューリングや同時負荷の変動があるため、ONの方が速い条件を性能改善とは解釈しない。大きなthroughput低下は見られないが、comma上での全instrumentationの負荷増加を保証する結果ではない。
+
+最終テストは121件中118件成功・GPU3件skip（最終実行セッションでは画面／OpenGL初期化不可）。それ以前の同じ作業中には119件全件成功し、GPU3件も実行済み。最終追加は時刻順序の不正検査と、診断喪失時に配信・PIDを維持する検証である。実FFmpegの4ビットレート照合と本番sender経由のローカルUDP照合は成功した。Ruffとgit diff --checkも通過。
+
+追加検証はchunk境界、188／564／1316境界、B=0順序、完了前stdout、負の完了→PES、PTS逆行・jump・wrap、TS continuity、欠落時の保留、bounded queue・標本、window reset、restart時の初期化、datagram対応・drop、stdin/sendto/read計測、FIONREADとproc失敗、OFF／idle、finalへの新metrics、同期喪失時の配信継続を含む。
+
+今回の本体ビルド・Linux実socket／proc計測・変更後の実機負荷／画面遅延・本家CI全体は未実施。Windowsの単体テストではswaglogのネイティブ依存をモックにし、cloudlogへ渡す内容を検証する。実機でcloudlogが保存されることは既報。
 
 ## 残る要因と次段階
 
-100msには、20fps取得周期（1周期50ms）、end_drawingの表示待ち、Pythonコピー・スケジューリング、パイプとFFmpeg内部キュー、ソフトウェアx264、TS解析、無線再送、PC復号と表示同期が影響し得る。GPUは現状の実測では小さいため改修しない。今回のframe診断は合成映像のstdin→PES観測までで、実UIの全経路を直接計測するものではない。wallclock補正の不連続と20fps time baseの量子化も残る。
+100msには、20fps取得周期（1周期50ms）、end_drawingの表示待ち、Pythonコピー・スケジューリング、パイプとFFmpeg内部キュー、ソフトウェアx264、TS解析、無線再送、PC復号と表示同期が影響し得る。GPUは現状の実測では小さいため改修しない。今回は実UIのcaptureから先頭datagramのsendto復帰までを観測するが、frame全体や受信表示までの直接計測ではない。wallclock補正の不連続と20fps time baseの量子化も残る。
 
-まず564 bytes・OS既定SO_SNDBUFでdrop・outq・stdin・queueを再計測する。混雑を解消しても数百ms以上残り、パイプ単独のframe診断でencoder区間が大きければthreads=1等と実機で存在確認したhardware encoderを比較する。stdin→stdoutが小さく、残りがMPEG-TS／receiver側にあるならAnnex-B → RTP/H.264 → UDP unicastを比較する。今回RTP化・hardware encoder選択・PBOは行わず、MPEG-TSとthreads=2を維持する。
+まず564 bytes・OS既定SO_SNDBUFでdrop・outq・stdin・queue・新stageを再計測する。diagが有効で送信drop・outq・pipe滞留が小さく、stdin→PESとPES→sendも小さいのに端末間遅延が数百ms残る場合、frame全体と受信側の残りを切り分けた上でRTP/H.264を比較する。FFmpeg CPUが高くstdin待ち・stdin→PESが大きい一方、pipe/outqが小さく、パイプ単独の厳密診断でも同傾向ならhardware encoderを検討する。CPUやstdin待ちの単独値だけで決めない。今回RTP・RTSP・WebRTC・SRT・hardware encoder・既存encoder流用・PBO・DMA-BUF・zero-copy・fps変更は実装しない。
 
 [本家の開発ガイド](CONTRIBUTING.md)と[AI支援方針](AI_POLICY.md)に従い、コミットにAssisted-byを記載する。

@@ -20,7 +20,7 @@ Development stays on `udp-screen-streaming`. Future upstream PRs target master; 
 1. 配信パラメーターを含むソースをビルドし、commaとPCを同じWi-Fiへ接続します。 / Build the source with streaming parameter keys and connect comma and the PC to the same Wi-Fi.
 2. Settings → Toggles → “UDP Screen Streaming”（日本語: UDP画面配信）をONにします。既定はOFFです。 / Enable “UDP Screen Streaming” in Settings → Toggles. It is off by default.
 3. “Destination Address”（送信先アドレス）にPCのWi-Fi IPv4（例: `192.168.4.44`）、ポートに`12346`を指定します。設定変更は自動反映されます。 / Set Destination Address to the PC's Wi-Fi IPv4 (e.g. `192.168.4.44`) and port to `12346`. Saved changes apply automatically.
-4. 以下の受信コマンドを1つだけ起動します。500／1000／1500 kbit/sでそれぞれ15～30秒以上配信し、統計と遅延を比較します。 / Start one receiver below. Stream for at least 15–30 seconds each at 500/1000/1500 kbit/s and compare statistics and latency.
+4. 以下の受信コマンドを1つだけ起動します。500／1000／1500 kbit/sで、設定変更後約10秒のウォームアップに続けて各30秒以上測定します。 / Start one receiver below. At each of 500/1000/1500 kbit/s, warm up for about 10 seconds after changing settings, then measure for at least 30 seconds.
 
 | 設定 / Setting | 許容値 / Allowed values | 既定値 / Default |
 | --- | --- | --- |
@@ -84,7 +84,7 @@ For multiline PowerShell commands, use a trailing backtick, not cmd's `^`. Omit 
 | Unicast | 564 bytes/datagram（TS 3個）、SO_SNDBUFはOS既定値 / 3 TS packets, OS-default SO_SNDBUF |
 | Multicast | 従来どおり1316 bytes集約とTTL / existing 1316-byte coalescing and TTL |
 | 監視 / Monitoring | D-Bus・設定を別スレッドで照会 / separate D-Bus and configuration polling threads |
-| 統計 / Statistics | 約5秒ごとの区間値・drop率・stdout量・outqと終了前のfinalログ / window rates, drops, stdout throughput, outq approximately every 5 seconds, plus final statistics before closing |
+| 統計 / Statistics | 約5秒ごとのstage時間・I/O待ち・drop率・pipe/socket残量・FFmpeg CPUと終了前finalログ / stage timings, I/O waits, drops, pipe/socket backlog and FFmpeg CPU approximately every 5 seconds, plus final statistics before closing |
 
 RGBA → FFmpeg stdin → libx264 / MPEG-TS → stdout (`pipe:1`) → Python socketの経路を維持します。送信側FFmpegは`file`・`pipe`対応だけで動作し、UDPプロトコルを必要としません。Linuxではstdoutのread可能通知で送信を再開し、固定bitrate pacingは加えません。SCHED_OTHERを維持し、意図的なnice +10設定を廃止します。GPU readbackは同期方式のままです。
 
@@ -104,9 +104,13 @@ The 75 ms and 100 ms limits apply to separate stages and do not guarantee a tota
 
 Device reports for `fe6f5b329` show roughly 800 ms at 500 kbit/s and 1300 ms at 1500. Actual SO_SNDBUF was 32768 with an outq peak of 33280 and substantial EAGAIN drops, while qdisc backlog and drop counters were zero. This revision replaces 188-byte datagrams and the forced 16 KiB send buffer. Device improvements after this change remain unmeasured.
 
-不規則入力のwall-clock PTSテストを維持し、500／1000／1500／3000 kbit/sのフレーム診断を追加しました。合成画像の識別子・復号PTS・PESを照合し、各frameのstdin完了→stdout初観測を測ります。解析は計測後に実施し、通常のUI配信には入れません。診断はパイプのみ、または本番Python UDP sender経由で比較できます。[検証結果・ベンチマーク・実機手順](docs/ui_udp_stream.md)を参照してください。
+実UI配信では小さいTS/PES observerにより、capture→PES初観測→その先頭TSを含むUDP送信までを計測します。入力順序・PTS・TS連続性を検査し、入力数とPES数が釣り合う区間だけ確定します。未確定記録は最大32件・2秒、stage標本は最大200件。同期を失った場合はdiag_active=0として次のFFmpegプロセスまで対応付けを休止し、配信は継続します。映像保存・再復号・本番UIへの識別子描画は行いません。
 
-Wall-clock PTS tests remain in place. New frame diagnostics at 500/1000/1500/3000 kbit/s match synthetic image IDs, decoded PTS, and PES records to measure each frame from stdin completion to first stdout observation. Parsing runs after measurement and is absent from normal UI streaming. Compare pipe-only diagnostics with the production Python UDP sender path. See the [validation results, benchmark, and device guide (Japanese)](docs/ui_udp_stream.md).
+During UI streaming, a small TS/PES observer measures capture → first PES observation → sending the datagram containing its first TS packet. It checks input order, PTS, and TS continuity, and confirms intervals only when input and PES counts balance. Unconfirmed records are limited to 32 and two seconds, with at most 200 samples per stage. Loss of synchronization sets diag_active=0 and suspends pairing until the next FFmpeg process; streaming continues. No video is saved or decoded, and no markers are drawn on the production UI.
+
+別途、合成画像の識別子・復号PTSを使う厳密なベンチマークと本番observerを500／1000／1500／3000 kbit/sで照合します。GPU・encoder・受信設定や75ms／100msの期限は維持しています。先頭datagramのsendto完了は、frame全体の送信完了やPC表示完了ではありません。[検証結果・ベンチマーク・実機手順](docs/ui_udp_stream.md)を参照してください。
+
+The separate benchmark validates the production observer against decoded synthetic frame IDs and PTS at 500/1000/1500/3000 kbit/s. GPU, encoder, receiver settings, and the separate 75 ms / 100 ms limits remain unchanged. Completion of the first datagram's sendto is not completion of the whole frame or PC display. See the [validation results, benchmark, and device guide (Japanese)](docs/ui_udp_stream.md).
 
 実機で最初に見る統計とハードウェアエンコーダの診断（自動採用はしません） / First device statistics to inspect and hardware-encoder discovery (no automatic selection):
 

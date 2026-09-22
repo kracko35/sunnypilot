@@ -12,7 +12,8 @@ class TestScreenStreamTimestamps(unittest.TestCase):
   def test_per_frame_pes_observation_matches_decoded_marker_and_input(self):
     for bitrate in [500, 1000, 1500, 3000]:
       with self.subTest(bitrate=bitrate):
-        _, result = feed_frames(ScreenStreamConfig(bitrate=bitrate), [0, .05, .10, .30, .35], frame_diagnostics=True)
+        _, result = feed_frames(ScreenStreamConfig(bitrate=bitrate), [0, .05, .10, .30, .35],
+                                frame_diagnostics=True, production_observer=True)
         records = result['frame_timings']
         self.assertEqual([record['frame'] for record in records], list(range(5)))
         self.assertGreater(records[3]['pts_90k'] - records[2]['pts_90k'], 9000)
@@ -22,6 +23,11 @@ class TestScreenStreamTimestamps(unittest.TestCase):
           self.assertAlmostEqual(record['stdin_to_stdout_ms'],
                                  (record['stdout_first_observed_s'] - record['stdin_complete_s']) * 1000)
         self.assertEqual(result['transport'], 'pipe-only')
+        self.assertEqual(result['production_latency']['encoder_pes_samples'], 5)
+        self.assertEqual(result['production_latency']['diag_sync_lost'], 0)
+        self.assertLess(result['observer_exact_avg_error_ms'], .001)
+        self.assertLess(result['observer_exact_p95_error_ms'], .001)
+        self.assertLess(result['observer_exact_max_error_ms'], .001)
 
   def test_irregular_feed_preserves_wallclock_gap_at_all_bitrates(self):
     for bitrate in [500, 1500, 3000]:

@@ -13,6 +13,7 @@ import time
 
 from openpilot.system.ui.lib.tests.screen_stream_test_support import load_screen_stream
 from openpilot.system.ui.lib.screen_stream_config import ScreenStreamConfig
+from openpilot.system.ui.lib.screen_stream_latency import FrameTimingObserver, MAX_SAMPLES
 from openpilot.system.ui.lib.tests.screen_stream_diagnostics import MARKER_BITS, MARKER_HEIGHT, frame_with_marker, match_frame_timings, video_pes_events
 
 stream = load_screen_stream()
@@ -25,7 +26,7 @@ def ffmpeg_path():
   return executable
 
 
-def feed_frames(config, schedule, *, command=None, frame=None, frame_diagnostics=False, udp_local_address=None):
+def feed_frames(config, schedule, *, command=None, frame=None, frame_diagnostics=False, udp_local_address=None, production_observer=False):
   command = list(command or stream.ffmpeg_command(config))
   command[0] = ffmpeg_path()
   command[1:1] = ['-protocol_whitelist', 'file,pipe']
@@ -34,14 +35,26 @@ def feed_frames(config, schedule, *, command=None, frame=None, frame_diagnostics
   completions, chunk_ends, chunk_times = [], [], []
   proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
   started = time.perf_counter()
+  # Windowsのmonotonicは粗い場合があるため、診断内だけ高分解能の同一clockへ揃える。
+  observer = FrameTimingObserver(clock=time.perf_counter) if production_observer else None
+  observer_cost = {'input': 0.0, 'output': 0.0}
 
   def observe(chunk):
-    observed = time.perf_counter() - started
+    now = time.perf_counter()
+    observed = now - started
     if not first_output:
       first_output.append(observed)
     chunks.append(chunk)
     chunk_ends.append((chunk_ends[-1] if chunk_ends else 0) + len(chunk))
     chunk_times.append(observed)
+    if observer is not None and udp_local_address is None:
+      before = time.perf_counter()
+      observer.observe(chunk, now)
+      end = chunk_ends[-1] // 188 * 188
+      begin = (chunk_ends[-2] if len(chunk_ends) > 1 else 0) // 188 * 188
+      # パイプ単独では読み終えたTSまでを仮想的に排出し、PES対応だけ照合する。
+      observer.datagram(begin, end, now, True)
+      observer_cost['output'] += time.perf_counter() - before
 
   def receive():
     while chunk := proc.stdout.read(65536):
@@ -55,6 +68,10 @@ def feed_frames(config, schedule, *, command=None, frame=None, frame_diagnostics
           time.sleep(remaining)
         before = time.perf_counter()
         arrivals.append(before - started)
+        if observer is not None:
+          cost_start = time.perf_counter()
+          observer.begin(index, before, before, before)
+          observer_cost['input'] += time.perf_counter() - cost_start
         data = memoryview(marked)
         while data:
           size = proc.stdin.write(data)
@@ -64,6 +81,10 @@ def feed_frames(config, schedule, *, command=None, frame=None, frame_diagnostics
         completed = time.perf_counter()
         completions.append(completed - started)
         writes.append(completed - before)
+        if observer is not None:
+          cost_start = time.perf_counter()
+          observer.complete(index, completed)
+          observer_cost['input'] += time.perf_counter() - cost_start
     except Exception as error:
       errors.append(repr(error))
     finally:
@@ -77,6 +98,7 @@ def feed_frames(config, schedule, *, command=None, frame=None, frame_diagnostics
   try:
     if udp_local_address is not None:
       sender = stream.MpegTsUdpSender(proc.stdout, udp_local_address, config, stdout_observer=observe)
+      sender.latency = observer
       sender.start()
     for thread in threads:
       thread.start()
@@ -109,6 +131,12 @@ def feed_frames(config, schedule, *, command=None, frame=None, frame_diagnostics
              'datagrams_by_payload': {str(size): math.ceil(len(ts) / size) for size in [188, 376, 564, 1316]}}
   if sender is not None:
     metrics['transport_stats'] = sender.stats_snapshot(time.monotonic())
+  if observer is not None:
+    metrics['production_latency'] = observer.snapshot(time.perf_counter(), elapsed, final=True)
+    if sender is None:
+      metrics['production_latency'] = {key: value for key, value in metrics['production_latency'].items()
+                                       if 'send' not in key and key != 'frame_first_datagram_drop_count'}
+      metrics['observer_call_wall_ms_per_frame'] = sum(observer_cost.values()) * 1000 / len(writes)
   if frame_diagnostics:
     events = video_pes_events(ts, chunk_ends, chunk_times)
     ids, pts = decode_markers(ts)
@@ -120,6 +148,16 @@ def feed_frames(config, schedule, *, command=None, frame=None, frame_diagnostics
       metrics[key + '_p95'] = values[math.ceil(len(values) * .95) - 1]
       metrics[key + '_max'] = max(values)
     metrics['negative_latency_samples'] = sum(record['stdin_to_stdout_ms'] < 0 for record in frames)
+    if observer is not None:
+      production = metrics['production_latency']
+      if not production['diag_active'] or production['encoder_pes_samples'] != len(frames):
+        raise RuntimeError(f'本番observerの対応が未確定です: {production}')
+      expected = sorted(record['stdin_to_stdout_ms'] for record in frames[-MAX_SAMPLES:])
+      metrics['observer_exact_avg_error_ms'] = abs(production['stdin_complete_to_pes_avg_ms'] - sum(expected) / len(expected))
+      metrics['observer_exact_p95_error_ms'] = abs(production['stdin_complete_to_pes_p95_ms'] - expected[math.ceil(len(expected) * .95) - 1])
+      metrics['observer_exact_max_error_ms'] = abs(production['stdin_complete_to_pes_max_ms'] - max(expected))
+      if max(metrics[key] for key in ('observer_exact_avg_error_ms', 'observer_exact_p95_error_ms', 'observer_exact_max_error_ms')) > 1:
+        raise RuntimeError('本番observerと識別子による厳密診断の差が1msを超えました')
   return ts, metrics
 
 
@@ -152,6 +190,7 @@ def main():
   parser.add_argument('--udp-address', help='指定時だけ本番のPython UDP senderで合成映像を送信する宛先IPv4')
   parser.add_argument('--local-address', help='UDP試験の送信元Wi-Fi IPv4')
   parser.add_argument('--port', type=int, default=12346)
+  parser.add_argument('--without-observer', action='store_true', help='本番observerを無効にして計測負荷を比較する')
   args = parser.parse_args()
   if not 2 <= args.frames <= 65536:
     parser.error('--framesは2～65536を指定してください')
@@ -163,7 +202,7 @@ def main():
   for bitrate in [500, 1000, 1500, 3000]:
     config = ScreenStreamConfig(address=args.udp_address or stream.DEFAULT_CONFIG.address, port=args.port, bitrate=bitrate)
     ts, result = feed_frames(config, [i / stream.FPS for i in range(args.frames)], frame=frame, frame_diagnostics=True,
-                             udp_local_address=args.local_address)
+                             udp_local_address=args.local_address, production_observer=not args.without_observer)
     pts, _ = decode_pts(ts)
     result['pts_span_s'] = pts[-1] - pts[0]
     result['feed_span_s'] = result['feed_times'][-1] - result['feed_times'][0]

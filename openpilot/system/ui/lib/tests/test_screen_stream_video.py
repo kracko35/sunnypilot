@@ -43,7 +43,8 @@ class TestScreenStreamVideo(unittest.TestCase):
       try:
         # 本番設定のloopback拒否は維持し、実socketの試験用だけ置換する。
         config = SimpleNamespace(**(vars(ScreenStreamConfig()) | {'address': '127.0.0.1', 'port': receiver.getsockname()[1]}))
-        ts, result = feed_frames(config, [0, .05, .10, .30, .35], frame_diagnostics=True, udp_local_address='127.0.0.1')
+        ts, result = feed_frames(config, [0, .05, .10, .30, .35], frame_diagnostics=True,
+                                udp_local_address='127.0.0.1', production_observer=True)
       finally:
         stopped.set()
         reader.join(timeout=2)
@@ -51,6 +52,9 @@ class TestScreenStreamVideo(unittest.TestCase):
       self.assertEqual(b''.join(packets), ts)
       self.assertEqual(len(result['frame_timings']), 5)
       self.assertEqual(result['transport_stats']['sender_drops'], 0)
+      self.assertEqual(result['production_latency']['encoder_pes_samples'], 5)
+      self.assertEqual(result['production_latency']['capture_to_udp_send_samples'], 5)
+      self.assertLess(result['observer_exact_avg_error_ms'], 1)
       self.assertEqual(result['transport_stats']['sender_datagrams'], len(packets))
       self.assertTrue(all(len(packet) == 564 for packet in packets[:-1]))
 

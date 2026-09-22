@@ -92,6 +92,8 @@ class TestScreenStreamer(unittest.TestCase):
     self.config.assert_not_called()
     self.assertEqual(self.processes, [])
     self.assertEqual(self.senders, [])
+    self.assertIsNone(self.streamer._latency)
+    self.assertIsNone(self.streamer._usage)
 
   def test_live_settings_restart_once_with_new_destination(self):
     self.enabled = True
@@ -281,6 +283,7 @@ class TestScreenStreamer(unittest.TestCase):
     self.enabled = True
     self.streamer.start()
     wait_until(self.streamer.ready.is_set)
+    old_observer = self.streamer._latency
     self.streamer.stats.record({'capture_count': 3}, capture=.004)
     self.config.return_value = ScreenStreamConfig(bitrate=1000)
     wait_until(lambda: len(self.processes) == 2 and self.streamer.ready.is_set())
@@ -289,6 +292,10 @@ class TestScreenStreamer(unittest.TestCase):
     self.assertIn('config changed', finals[0])
     self.assertIn('capture_count=3', finals[0])
     self.assertIn('bitrate=1500', finals[0])
+    self.assertIn('encoder_pes_samples=0', finals[0])
+    self.assertIn('stdin_write_syscalls=0', finals[0])
+    self.assertIn('ffmpeg_cpu_pct=None', finals[0])
+    self.assertIsNot(self.streamer._latency, old_observer)
     self.assertEqual(self.streamer.stats.snapshot()['capture_count'], 0)
     messages = [call.args[0] for call in self.cloudlog.info.call_args_list]
     stopped = next(i for i, message in enumerate(messages) if 'screen stream stopped:' in message)
@@ -299,6 +306,35 @@ class TestScreenStreamer(unittest.TestCase):
     finals = [call.args[0] for call in self.cloudlog.info.call_args_list if 'screen stream latency final:' in call.args[0]]
     self.assertEqual(len(finals), 2)
     self.assertIn('stream disabled', finals[-1])
+    self.assertIsNone(self.streamer._latency)
+    self.assertIsNone(self.streamer._usage)
+
+  def test_stdin_blocking_waits_and_partial_syscalls_are_aggregated(self):
+    self.streamer._proc = Mock()
+    with patch.object(stream.os, 'write', side_effect=[2, BlockingIOError(), 3]), \
+         patch.object(stream.time, 'perf_counter', side_effect=[1.0, 1.002]):
+      self.streamer._write_frame(time.monotonic(), b'12345')
+    result = self.streamer.stats.snapshot(reset=True)
+    self.assertEqual(result['stdin_write_syscalls'], 3)
+    self.assertEqual(result['stdin_bytes'], 5)
+    self.assertEqual(result['stdin_blocked_events'], 1)
+    self.assertEqual(result['stdin_blocked_wait_ms'], 2)
+    self.assertEqual(result['stdin_blocked_wait_avg_ms'], 2)
+    self.assertEqual(result['stdin_blocked_wait_max_ms'], 2)
+    self.assertEqual(self.streamer.stats.snapshot()['stdin_write_syscalls'], 0)
+
+  def test_observer_sync_loss_does_not_restart_or_stop_stream(self):
+    self.enabled = True
+    with patch.object(stream.os, 'write', side_effect=lambda fd, data: len(data)):
+      self.streamer.start()
+      wait_until(self.streamer.ready.is_set)
+      self.streamer._latency.observe(b'X' * 188, time.monotonic())
+      self.streamer.submit(bytes(stream.FRAME_BYTES))
+      wait_until(lambda: self.streamer.stats.snapshot()['frames_written'] == 1)
+      self.assertEqual(len(self.processes), 1)
+      self.assertEqual(self.streamer._restart_count, 0)
+      self.assertFalse(self.streamer._latency.active)
+      self.assertTrue(self.streamer.ready.is_set())
 
   def test_congestion_warning_does_not_restart_encoder(self):
     self.enabled = True
@@ -533,7 +569,7 @@ class TestScreenStreamer(unittest.TestCase):
     with patch.object(stream.os, 'write', return_value=stream.FRAME_BYTES) as write:
       self.streamer.start()
       wait_until(self.streamer.ready.is_set)
-      self.streamer._frames.put_nowait((time.monotonic() - .080, bytes(stream.FRAME_BYTES)))
+      self.streamer._frames.put_nowait((time.monotonic() - .080, bytes(stream.FRAME_BYTES), 1))
       wait_until(self.streamer._frames.empty)
       # 次の新鮮なフレームまで処理できれば、古いフレームによる書き込みも再起動もない。
       self.streamer.submit(bytes(stream.FRAME_BYTES))
@@ -734,6 +770,81 @@ class TestCommand(unittest.TestCase):
 
 
 class TestMpegTsUdpSender(unittest.TestCase):
+  def test_sendto_syscall_duration_and_eagain_window(self):
+    with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'), \
+         patch.object(stream, 'cloudlog'), patch.object(stream.time, 'perf_counter', side_effect=[1, 1.00004, 2, 2.00002]):
+      create.return_value.sendto.side_effect = [564, BlockingIOError(errno.EAGAIN, 'busy')]
+      sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      try:
+        self.assertTrue(sender._send_datagram(bytes(564)))
+        self.assertFalse(sender._send_datagram(bytes(564)))
+        result = sender.stats_snapshot(time.monotonic())
+        self.assertEqual(result['sendto_calls'], 2)
+        self.assertEqual(result['sendto_eagain_count'], 1)
+        self.assertEqual(result['sendto_avg_us'], 30)
+        self.assertEqual(result['sendto_max_us'], 40)
+        result = sender.stats_snapshot(time.monotonic())
+        self.assertEqual(result['sendto_calls'], 0)
+        self.assertEqual(result['sendto_max_us'], 0)
+      finally:
+        sender.close()
+
+  def test_stdout_read_eagain_wait_window(self):
+    with patch.object(stream.socket, 'socket') as create, patch.object(stream.os, 'set_blocking'), \
+         patch.object(stream.os, 'read', side_effect=[BlockingIOError(), b'A' * 564, b'']), \
+         patch.object(stream.MpegTsUdpSender, '_wait_readable'), patch.object(stream.MpegTsUdpSender, 'sample_outq'), \
+         patch.object(stream.time, 'perf_counter', side_effect=[1, 1.003, 2, 2.00002]):
+      create.return_value.sendto.return_value = 564
+      sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', ScreenStreamConfig('192.168.1.1'))
+      sender._run()
+      self.assertIsNone(sender.error)
+      result = sender.stats_snapshot(time.monotonic())
+      self.assertEqual(result['stdout_read_calls'], 3)
+      self.assertEqual(result['stdout_eagain_count'], 1)
+      self.assertEqual(result['stdout_wait_ms'], 3)
+      self.assertEqual(result['stdout_wait_max_ms'], 3)
+      self.assertEqual(result['stdout_bytes'], 564)
+      self.assertEqual(result['stdout_chunks'], 1)
+
+  def test_pipe_backlog_sampling_reset_and_failure_are_nonfatal(self):
+    fcntl = Mock()
+    count = 0
+
+    def ioctl(fd, request, values, mutate):
+      nonlocal count
+      if request == 2:
+        count += 1
+        if count == 3:
+          raise OSError('unsupported')
+        values[0] = 1000 if count == 1 else 200
+      else:
+        values[0] = 10
+
+    fcntl.ioctl.side_effect = ioctl
+    with patch.object(stream.socket, 'socket'), patch.object(stream.os, 'set_blocking'), \
+         patch.object(stream.sys, 'platform', 'linux'), patch.dict(sys.modules, {'fcntl': fcntl, 'termios': SimpleNamespace(TIOCOUTQ=1, FIONREAD=2)}):
+      sender = stream.MpegTsUdpSender(Mock(), '127.0.0.1', ScreenStreamConfig())
+      try:
+        with patch.object(stream.time, 'monotonic', return_value=1):
+          sender.sample_outq()
+          sender.sample_outq()
+        self.assertEqual(fcntl.ioctl.call_count, 2)
+        result = sender.stats_snapshot(1.05)
+        self.assertEqual(result['stdout_pipe_available_window_peak'], 1000)
+        with patch.object(stream.time, 'monotonic', return_value=1.2):
+          sender.sample_outq()
+        result = sender.stats_snapshot(1.25)
+        self.assertEqual(result['stdout_pipe_available_current'], 200)
+        self.assertEqual(result['stdout_pipe_available_window_peak'], 200)
+        with patch.object(stream.time, 'monotonic', return_value=1.4):
+          sender.sample_outq()
+        result = sender.stats_snapshot(1.45)
+        self.assertIsNone(result['stdout_pipe_available_current'])
+        self.assertIsNone(result['stdout_pipe_available_window_peak'])
+        self.assertIsNone(sender.error)
+      finally:
+        sender.close()
+
   def setUp(self):
     log_patch = patch.object(stream, 'cloudlog')
     self.cloudlog = log_patch.start()

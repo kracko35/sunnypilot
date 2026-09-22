@@ -80,8 +80,9 @@ class CachedQuery:
 
 class LatencyStats:
   """短いロックで集計し、ログ整形はフレーム処理の外で行う。時間の入力単位は秒。"""
-  COUNTERS = ('capture_count', 'submitted_count', 'queue_replaced_count', 'stale_drop_count', 'frames_written')
-  TIMINGS = ('capture', 'gpu_scale', 'readback', 'bytes_copy', 'queue_age', 'stdin_write', 'frame_age_written')
+  COUNTERS = ('capture_count', 'submitted_count', 'queue_replaced_count', 'stale_drop_count', 'frames_written',
+              'stdin_write_syscalls', 'stdin_blocked_events', 'stdin_bytes')
+  TIMINGS = ('capture', 'gpu_scale', 'readback', 'bytes_copy', 'queue_age', 'stdin_write', 'frame_age_written', 'stdin_blocked_wait')
 
   def __init__(self):
     self._lock = threading.Lock()
@@ -105,6 +106,17 @@ class LatencyStats:
       for name, (count, total, maximum) in self._timings.items():
         result[f'{name}_avg_ms'] = round(total * 1000 / count, 3) if count else 0.0
         result[f'{name}_max_ms'] = round(maximum * 1000, 3)
+        if name == 'stdin_blocked_wait':
+          result['stdin_blocked_wait_ms'] = round(total * 1000, 3)
       if reset:
         self._reset()
       return result
+
+  def record_stdin(self, calls, blocked, size, wait, maximum):
+    # syscallごとにはロックせず、入力frameの完了・失敗時に一度だけ反映する。
+    with self._lock:
+      self._counts['stdin_write_syscalls'] += calls
+      self._counts['stdin_blocked_events'] += blocked
+      self._counts['stdin_bytes'] += size
+      count, total, old_max = self._timings['stdin_blocked_wait']
+      self._timings['stdin_blocked_wait'] = count + blocked, total + wait, max(old_max, maximum)

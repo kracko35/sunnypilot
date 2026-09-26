@@ -56,7 +56,10 @@ class VncServer:
 
   def _run(self):
     if hasattr(os, 'sched_setscheduler'):
-      os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+      try:
+        os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+      except OSError:
+        pass
     while not self._stop.is_set():
       try:
         if self._active():

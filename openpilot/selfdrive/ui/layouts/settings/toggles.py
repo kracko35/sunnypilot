@@ -4,7 +4,7 @@ from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.list_view import multiple_button_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
-from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.application import RECORD, gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -94,6 +94,12 @@ class TogglesLayout(Widget):
         "metric.png",
         False,
       ),
+      "ScreenVncEnabled": (
+        lambda: tr("VNC Screen Streaming"),
+        tr_noop("Share the screen over VNC on TCP port 5900 without a password. Unavailable while screen recording is active."),
+        "monitoring.png",
+        False,
+      ),
     }
 
     self._long_personality_setting = multiple_button_item(
@@ -140,6 +146,7 @@ class TogglesLayout(Widget):
         self._toggles["LongitudinalPersonality"] = self._long_personality_setting
 
     self._update_experimental_mode_icon()
+    self._toggles["ScreenVncEnabled"].action_item.set_enabled(not RECORD)
     self._scroller = Scroller(list(self._toggles.values()), line_separator=True, spacing=0)
 
     ui_state.add_engaged_transition_callback(self._update_toggles)

@@ -19,6 +19,7 @@ def main():
   config_realtime_process(0, Priority.CTRL_HIGH)
 
   gui_app.init_window("UI")
+  gui_app.enable_vnc(lambda: ui_state.params.get_bool("ScreenVncEnabled"))
   if BIG_UI:
     MainLayout()
   else:
